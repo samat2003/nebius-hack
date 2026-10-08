@@ -1,0 +1,213 @@
+{
+  "semantics": {
+    "available_tools": [
+      {
+        "canonical_capability": "LIST_FILES",
+        "description": "Synthetic directory listing tool",
+        "external_name": "list_files",
+        "parameters_schema": {
+          "properties": {
+            "directory": {
+              "default": ".",
+              "type": "string"
+            }
+          },
+          "required": [
+            "directory"
+          ],
+          "type": "object"
+        }
+      }
+    ],
+    "candidates": [
+      {
+        "arguments": {
+          "directory": "."
+        },
+        "arguments_complete": true,
+        "candidate_id": "cand_tool_list_files",
+        "canonical_intent": "LIST_FILES",
+        "cost_class": "LOW",
+        "disposition": "EXTERNAL_TOOL",
+        "evidence_refs": [],
+        "external_tool_name": "list_files",
+        "generation_job_type": null,
+        "rationale": "Candidate for external tool 'list_files'.",
+        "requires_generation": false,
+        "risk_class": "LOW"
+      },
+      {
+        "arguments": {},
+        "arguments_complete": true,
+        "candidate_id": "cand_answer",
+        "canonical_intent": "RESPOND",
+        "cost_class": "LOW",
+        "disposition": "GENERATION_JOB",
+        "evidence_refs": [],
+        "external_tool_name": null,
+        "generation_job_type": "ANSWER",
+        "rationale": "Synthesize a direct assistant response to the latest user request.",
+        "requires_generation": true,
+        "risk_class": "LOW"
+      }
+    ],
+    "decision_semantics": {
+      "guard_metadata": {
+        "bypassed_controller": false,
+        "fallback_reason": null,
+        "fallback_used": false,
+        "verification_required": false
+      },
+      "model_id": "samatv256/mini-Jev",
+      "model_revision": "fake-v1",
+      "provider_name": "fake_controller",
+      "scores": [
+        {
+          "candidate_id": "cand_tool_list_files",
+          "score": 0.5
+        },
+        {
+          "candidate_id": "cand_answer",
+          "score": 0.95
+        }
+      ],
+      "selected_candidate_id": "cand_answer"
+    },
+    "generation_job": {
+      "candidate_id": "cand_answer",
+      "initial_user_request": "Synthetic user task: verify deterministic state and decision replay.",
+      "job_id": "job_5fad1efc863d6b4b",
+      "job_type": "ANSWER",
+      "latest_user_request": "Synthetic user task: verify deterministic state and decision replay.",
+      "max_tokens": 64,
+      "selected_evidence": [
+        "src/example.py\ntests/test_example.py"
+      ],
+      "target_tool_name": null,
+      "temperature": 0.0,
+      "trusted_system_instructions": [
+        "Synthetic system policy for offline replay verification."
+      ]
+    },
+    "generation_semantics": {
+      "content": "[fake:answer] Processed request: Synthetic user task: verify deterministic state and decision replay. (with 1 evidence item(s))",
+      "job_id": "job_5fad1efc863d6b4b",
+      "job_type": "ANSWER",
+      "model_id": "nvidia/nemotron",
+      "model_revision": "fake-v1",
+      "provider_name": "fake_generator",
+      "structured_arguments": null
+    },
+    "logical_response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "[fake:answer] Processed request: Synthetic user task: verify deterministic state and decision replay. (with 1 evidence item(s))",
+            "role": "assistant",
+            "tool_calls": null
+          }
+        }
+      ],
+      "model": "alienese-default",
+      "system_fingerprint": "fp_a7d36c56c7a8"
+    },
+    "normalized_events": [
+      {
+        "content": "Synthetic system policy for offline replay verification.",
+        "event_id": "evt_0000_444485ce01f7f3b8",
+        "kind": "SYSTEM_MESSAGE",
+        "provenance": {
+          "external_tool_call_id": null,
+          "message_index": 0,
+          "source_role": "system",
+          "sub_index": 0,
+          "tool_name": null
+        },
+        "sequence_no": 0,
+        "tool_arguments": null,
+        "tool_call_id": null,
+        "tool_name": null,
+        "trust": "SYSTEM_TRUSTED"
+      },
+      {
+        "content": "Synthetic user task: verify deterministic state and decision replay.",
+        "event_id": "evt_0001_5bc07a174fb06778",
+        "kind": "USER_MESSAGE",
+        "provenance": {
+          "external_tool_call_id": null,
+          "message_index": 1,
+          "source_role": "user",
+          "sub_index": 0,
+          "tool_name": null
+        },
+        "sequence_no": 1,
+        "tool_arguments": null,
+        "tool_call_id": null,
+        "tool_name": null,
+        "trust": "USER"
+      },
+      {
+        "content": "",
+        "event_id": "evt_0002_eae6a30fc2c2471a",
+        "kind": "TOOL_CALL",
+        "provenance": {
+          "external_tool_call_id": "call_synth_01",
+          "message_index": 2,
+          "source_role": "assistant",
+          "sub_index": 0,
+          "tool_name": "list_files"
+        },
+        "sequence_no": 2,
+        "tool_arguments": {
+          "directory": "."
+        },
+        "tool_call_id": "call_synth_01",
+        "tool_name": "list_files",
+        "trust": "MODEL_GENERATED"
+      },
+      {
+        "content": "src/example.py\ntests/test_example.py",
+        "event_id": "evt_0003_1eb97e2728f40c54",
+        "kind": "TOOL_RESULT",
+        "provenance": {
+          "external_tool_call_id": "call_synth_01",
+          "message_index": 3,
+          "source_role": "tool",
+          "sub_index": 0,
+          "tool_name": "list_files"
+        },
+        "sequence_no": 3,
+        "tool_arguments": null,
+        "tool_call_id": "call_synth_01",
+        "tool_name": "list_files",
+        "trust": "UNTRUSTED_EXTERNAL"
+      }
+    ],
+    "state_digest": "a7d36c56c7a8cc66f8f7f235dcd694f721cda911f83c0f501263080e452d2bdd",
+    "versions": {
+      "normalizer_version": "v1",
+      "policy_version": "v1",
+      "runtime_version": "0.1.0",
+      "state_schema_version": "v1"
+    }
+  },
+  "telemetry": {
+    "correlation_trace_id": "trc_fixture_001",
+    "decision_telemetry": {
+      "completion_tokens": 0,
+      "latency_ms": 1.5,
+      "prompt_tokens": 0,
+      "request_attempt_id": "req_fixture_001"
+    },
+    "generation_telemetry": {
+      "completion_tokens": 16,
+      "latency_ms": 2.0,
+      "prompt_tokens": 9,
+      "request_attempt_id": "req_fixture_001"
+    },
+    "operation_id": "op_fixture_001",
+    "request_id": "req_fixture_001"
+  }
+}
