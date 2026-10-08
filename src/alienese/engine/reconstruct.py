@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -45,6 +46,8 @@ _VERIFICATION_CAPABILITIES: frozenset[CanonicalCapability] = frozenset(
 
 def _canonicalize_json_value(value: Any) -> Any:
     """Recursively canonicalize mappings and sequences for deterministic hashing."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ProtocolError("Non-finite float (NaN or Infinity) is not permitted in state.")
     if isinstance(value, Mapping):
         return {str(k): _canonicalize_json_value(value[k]) for k in sorted(value.keys(), key=str)}
     if isinstance(value, (list, tuple)):
@@ -118,6 +121,7 @@ def compute_state_digest(
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
+        allow_nan=False,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -258,6 +262,16 @@ def reconstruct_from_checkpoint(
             if not event.tool_call_id or event.tool_call_id not in pending_ids:
                 raise ProtocolError(
                     f"Orphan or duplicate TOOL_RESULT for tool_call_id '{event.tool_call_id}'."
+                )
+            origin_actions = [a for a in recent_actions if a.tool_call_id == event.tool_call_id]
+            if (
+                origin_actions
+                and event.tool_name is not None
+                and event.tool_name != origin_actions[0].tool_name
+            ):
+                raise ProtocolError(
+                    f"TOOL_RESULT tool_name '{event.tool_name}' does not match originating "
+                    f"TOOL_CALL tool_name '{origin_actions[0].tool_name}'."
                 )
             pending_ids.remove(event.tool_call_id)
             latest_observation = ToolObservation(

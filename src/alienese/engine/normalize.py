@@ -104,7 +104,9 @@ def _compute_event_id(
         "content": content,
         "args": tool_arguments,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     return f"evt_{sequence_no:04d}_{digest}"
 
@@ -145,6 +147,14 @@ def normalize_messages(
     for msg_idx, msg in enumerate(messages):
         role = SourceRole(msg.role)
         text_content = msg.normalized_text_content()
+
+        if pending_tool_calls and role != SourceRole.TOOL:
+            unresolved = ", ".join(sorted(pending_tool_calls))
+            raise ProtocolError(
+                f"Unresolved tool_calls ({unresolved}) must be followed by 'tool' role "
+                f"messages before message role '{role.value}' at index {msg_idx}.",
+                param=f"messages[{msg_idx}].role",
+            )
 
         if role in (SourceRole.SYSTEM, SourceRole.DEVELOPER):
             if msg.tool_calls:
@@ -219,6 +229,11 @@ def normalize_messages(
                 raise ProtocolError(
                     f"Assistant message at index {msg_idx} cannot contain tool_call_id.",
                     param=f"messages[{msg_idx}].tool_call_id",
+                )
+            if msg.tool_calls is not None and len(msg.tool_calls) == 0:
+                raise ProtocolError(
+                    f"Assistant message at index {msg_idx} has an empty 'tool_calls' list.",
+                    param=f"messages[{msg_idx}].tool_calls",
                 )
             sub_idx = 0
             has_tool_calls = bool(msg.tool_calls)
@@ -351,6 +366,13 @@ def normalize_messages(
                 )
             )
             sequence_no += 1
+
+    if pending_tool_calls:
+        unresolved = ", ".join(sorted(pending_tool_calls))
+        raise ProtocolError(
+            f"Conversation ended with unresolved tool_call_id(s): {unresolved}.",
+            param="messages",
+        )
 
     return tuple(events)
 

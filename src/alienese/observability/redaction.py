@@ -7,14 +7,13 @@ Secrets must never enter logs, traces, or model context accidentally.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from typing import Any
 
 from pydantic import SecretStr
 
 REDACTED_PLACEHOLDER = "[REDACTED]"
 
-# Normalized (lowercase, alphanumeric + underscore) key fragments that indicate secrets
 _SENSITIVE_KEY_NAMES: frozenset[str] = frozenset(
     {
         "authorization",
@@ -51,15 +50,26 @@ _SENSITIVE_KEY_SUFFIXES: tuple[str, ...] = (
     "_credentials",
 )
 
-# Value-level patterns for obvious secrets embedded in strings
 _BEARER_PATTERN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_AUTH_PATTERN = re.compile(r"(?i)\b(Basic\s+)[A-Za-z0-9+/=]{6,}")
 _PEM_PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
 )
-_SK_TOKEN_PATTERN = re.compile(r"\b(?:sk|rk|pk|nvapi)-[A-Za-z0-9_-]{12,}\b")
+_KNOWN_TOKEN_PREFIX_PATTERN = re.compile(
+    r"\b(?:sk|rk|pk|nvapi)-[A-Za-z0-9_-]{12,}\b"
+    r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}\b"
+    r"|\bgithub_pat_[A-Za-z0-9_]{16,}\b"
+    r"|\bhf_[A-Za-z0-9]{16,}\b"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{12,}\b"
+    r"|\bAIza[0-9A-Za-z_-]{20,}\b"
+)
+_JSON_KEY_VALUE_PATTERN = re.compile(
+    r'(?i)("(?:[a-z0-9_]*_)?(?:api[_-]?key|apikey|secret|token|password|private_key|authorization)"\s*:\s*")'
+    r'(?!\[REDACTED\])([^"]{4,})(")'
+)
 _INLINE_KEY_VALUE_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|secret|token|password|authorization)\s*([:=])\s*([^\s,;\"']{6,})"
+    r"(?i)\b(api[_-]?key|apikey|secret|token|password|authorization)\s*([:=])\s*"
+    r"(?!Bearer\b|Basic\b|\[REDACTED\])([^\s,;\x22\x27&]{6,})"
 )
 
 
@@ -78,7 +88,8 @@ def redact_string(value: str) -> str:
     result = _PEM_PRIVATE_KEY_PATTERN.sub(REDACTED_PLACEHOLDER, value)
     result = _BEARER_PATTERN.sub(rf"\1{REDACTED_PLACEHOLDER}", result)
     result = _BASIC_AUTH_PATTERN.sub(rf"\1{REDACTED_PLACEHOLDER}", result)
-    result = _SK_TOKEN_PATTERN.sub(REDACTED_PLACEHOLDER, result)
+    result = _KNOWN_TOKEN_PREFIX_PATTERN.sub(REDACTED_PLACEHOLDER, result)
+    result = _JSON_KEY_VALUE_PATTERN.sub(rf"\1{REDACTED_PLACEHOLDER}\3", result)
     result = _INLINE_KEY_VALUE_PATTERN.sub(rf"\1\2{REDACTED_PLACEHOLDER}", result)
     return result
 
@@ -95,6 +106,10 @@ def redact_value(value: Any) -> Any:
         return tuple(redact_value(item) for item in value)
     if isinstance(value, list):
         return [redact_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return frozenset(redact_value(item) for item in value)
+    if isinstance(value, Set):
+        return {redact_value(item) for item in value}
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         return [redact_value(item) for item in value]
     return value

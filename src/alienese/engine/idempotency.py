@@ -13,19 +13,81 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable
 
-from alienese.api.errors import IdempotencyConflict
-from alienese.api.models import ChatCompletionRequest, ChatCompletionResponse
+from alienese.api.errors import IdempotencyConflict, ProtocolError
+from alienese.api.models import ChatCompletionRequest, ChatCompletionResponse, NamedToolChoice
 from alienese.contracts.context import RequestContext
 from alienese.observability.logging import get_request_logger
 from alienese.storage.idempotency import IdempotencyRecord, IdempotencyStore
 
+_VALID_IDEMPOTENCY_KEY_RE = re.compile(r"^[\x21-\x7E]{1,255}$")
+
+
+def validate_idempotency_key(raw_key: str) -> str:
+    """Validate that an Idempotency-Key is 1..255 printable ASCII characters."""
+    cleaned = raw_key.strip()
+    if not _VALID_IDEMPOTENCY_KEY_RE.match(cleaned):
+        raise ProtocolError(
+            "Header 'Idempotency-Key' must be 1 to 255 printable non-whitespace ASCII characters.",
+            param="Idempotency-Key",
+            code="invalid_idempotency_key",
+        )
+    return cleaned
+
 
 def compute_request_fingerprint(request: ChatCompletionRequest) -> str:
     """Compute a canonical SHA-256 fingerprint over the semantic request body."""
-    payload = request.model_dump(mode="json", exclude_none=True)
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    canonical_messages = [
+        {
+            "role": m.role,
+            "content": m.normalized_text_content(),
+            "name": m.name,
+            "tool_call_id": m.tool_call_id,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": json.loads(tc.function.arguments)
+                        if tc.function.arguments.strip()
+                        else {},
+                    },
+                }
+                for tc in m.tool_calls
+            ]
+            if m.tool_calls
+            else None,
+        }
+        for m in request.messages
+    ]
+    canonical_tools = (
+        [t.model_dump(mode="json", exclude_none=True) for t in request.tools]
+        if request.tools
+        else None
+    )
+    tool_choice_val = (
+        request.tool_choice.model_dump(mode="json")
+        if isinstance(request.tool_choice, NamedToolChoice)
+        else (request.tool_choice or "auto")
+    )
+    semantic_payload = {
+        "model": request.model,
+        "messages": canonical_messages,
+        "tools": canonical_tools,
+        "tool_choice": tool_choice_val if canonical_tools else "none",
+        "temperature": request.temperature,
+        "effective_max_tokens": request.effective_max_tokens,
+    }
+    encoded = json.dumps(
+        semantic_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -41,19 +103,13 @@ class IdempotencyCoordinator:
         request: ChatCompletionRequest,
         runner: Callable[[RequestContext], Awaitable[ChatCompletionResponse]],
     ) -> tuple[RequestContext, ChatCompletionResponse, bool]:
-        """Execute `runner` idempotently.
-
-        Returns `(effective_context, response, was_replayed)`.
-        When replayed, `effective_context.operation_id` is updated to the original
-        logical `operation_id`, while `effective_context.request_id` remains the
-        current HTTP attempt's ID.
-        """
+        """Execute `runner` idempotently."""
         raw_key = ctx.idempotency_key
         if raw_key is None or not raw_key.strip():
             response = await runner(ctx)
             return ctx, response, False
 
-        key = raw_key.strip()
+        key = validate_idempotency_key(raw_key)
         fingerprint = compute_request_fingerprint(request)
         lock = self._store.key_lock(key)
 

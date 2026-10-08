@@ -72,6 +72,11 @@ async def create_chat_completion(
             f"Malformed JSON request body: {exc.msg}",
             code="invalid_json",
         ) from exc
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(
+            "Request body must be valid UTF-8 encoded JSON.",
+            code="invalid_encoding",
+        ) from exc
 
     if not isinstance(raw_body, dict):
         raise ProtocolError(

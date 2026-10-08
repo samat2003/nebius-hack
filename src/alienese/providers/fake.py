@@ -30,6 +30,7 @@ from alienese.contracts.providers import (
     RetrievalSemantics,
 )
 from alienese.contracts.state import WorkingState
+from alienese.observability.redaction import redact_string
 from alienese.providers.base import ProviderFaultMode, raise_for_fault_mode
 
 
@@ -218,7 +219,9 @@ class FakeGenerator:
         """Deterministically synthesize a response for a typed GenerationJob."""
         raise_for_fault_mode(self.provider_name, self.fault_mode)
 
-        prompt_summary = (job.latest_user_request or job.initial_user_request or "").strip()
+        prompt_summary = redact_string(
+            (job.latest_user_request or job.initial_user_request or "").strip()
+        )
         if not prompt_summary:
             prompt_summary = "no user prompt"
 

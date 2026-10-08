@@ -11,8 +11,10 @@ Enforces core runtime invariants:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -65,6 +67,7 @@ from alienese.contracts.traces import (
 from alienese.engine.normalize import normalize_request
 from alienese.engine.reconstruct import reconstruct
 from alienese.observability.logging import get_request_logger
+from alienese.observability.redaction import redact_mapping, redact_string
 from alienese.observability.tracing import RuntimeTracer
 from alienese.storage.traces import TraceStore, sanitize_replay_artifact
 
@@ -79,7 +82,11 @@ def _matches_json_schema_type(value: Any, expected_type: str) -> bool:
     if expected_type == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
     if expected_type == "array":
         return isinstance(value, (list, tuple))
     if expected_type == "object":
@@ -87,6 +94,92 @@ def _matches_json_schema_type(value: Any, expected_type: str) -> bool:
     if expected_type == "null":
         return value is None
     return False
+
+
+def _validate_schema_node(
+    schema: Mapping[str, Any],
+    value: Any,
+    *,
+    path: str,
+) -> tuple[bool, str | None]:
+    expected_type = schema.get("type")
+    if isinstance(expected_type, str):
+        if not _matches_json_schema_type(value, expected_type):
+            return False, f"Argument '{path}' failed type check: expected {expected_type}."
+    elif isinstance(expected_type, list):
+        if not any(
+            isinstance(t, str) and _matches_json_schema_type(value, t) for t in expected_type
+        ):
+            return (
+                False,
+                f"Argument '{path}' failed union type check: expected one of {expected_type}.",
+            )
+    elif expected_type is not None:
+        return False, f"Unsupported schema 'type' specification at '{path}'."
+
+    enum_values = schema.get("enum")
+    if enum_values is not None:
+        if not isinstance(enum_values, list) or len(enum_values) == 0:
+            return False, f"Invalid or empty 'enum' definition at '{path}'."
+        if value not in enum_values:
+            return False, f"Argument '{path}' value is not in allowed enum {enum_values}."
+
+    if isinstance(value, str):
+        min_len = schema.get("minLength")
+        if isinstance(min_len, int) and len(value) < min_len:
+            return False, f"Argument '{path}' shorter than minLength={min_len}."
+        max_len = schema.get("maxLength")
+        if isinstance(max_len, int) and len(value) > max_len:
+            return False, f"Argument '{path}' exceeds maxLength={max_len}."
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            return False, f"Argument '{path}' is less than minimum={minimum}."
+        maximum = schema.get("maximum")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            return False, f"Argument '{path}' exceeds maximum={maximum}."
+
+    if isinstance(value, (list, tuple)):
+        items_schema = schema.get("items")
+        if isinstance(items_schema, Mapping):
+            for idx, elem in enumerate(value):
+                ok, reason = _validate_schema_node(items_schema, elem, path=f"{path}[{idx}]")
+                if not ok:
+                    return False, reason
+
+    if isinstance(value, Mapping):
+        required_fields = schema.get("required", [])
+        if not isinstance(required_fields, list) or not all(
+            isinstance(k, str) for k in required_fields
+        ):
+            return False, f"Schema 'required' field at '{path}' must be a list of strings."
+        for req_key in required_fields:
+            if req_key not in value:
+                return False, f"Missing required tool argument '{req_key}'."
+
+        properties = schema.get("properties", {})
+        if not isinstance(properties, Mapping):
+            return False, f"Schema 'properties' field at '{path}' must be an object."
+
+        additional_props = schema.get("additionalProperties", True)
+        if additional_props is False:
+            for arg_key in value:
+                if arg_key not in properties:
+                    return (
+                        False,
+                        f"Unexpected argument '{arg_key}' (additionalProperties=false).",
+                    )
+
+        for arg_key, arg_val in value.items():
+            prop_schema = properties.get(arg_key)
+            if isinstance(prop_schema, Mapping):
+                child_path = str(arg_key) if path == "$" else f"{path}.{arg_key}"
+                ok, reason = _validate_schema_node(prop_schema, arg_val, path=child_path)
+                if not ok:
+                    return False, reason
+
+    return True, None
 
 
 def validate_tool_arguments_against_schema(
@@ -101,49 +194,7 @@ def validate_tool_arguments_against_schema(
     if schema_type != "object":
         return False, f"Unsupported top-level parameters schema type '{schema_type}'."
 
-    required_fields = parameters_schema.get("required", [])
-    if not isinstance(required_fields, list):
-        return False, "Schema 'required' field must be a list."
-
-    for req_key in required_fields:
-        if req_key not in arguments:
-            return False, f"Missing required tool argument '{req_key}'."
-
-    properties = parameters_schema.get("properties", {})
-    if not isinstance(properties, Mapping):
-        return False, "Schema 'properties' field must be an object."
-
-    additional_props = parameters_schema.get("additionalProperties", True)
-    if additional_props is False:
-        for arg_key in arguments:
-            if arg_key not in properties:
-                return False, f"Unexpected argument '{arg_key}' (additionalProperties=false)."
-
-    for arg_key, arg_val in arguments.items():
-        prop_schema = properties.get(arg_key)
-        if not isinstance(prop_schema, Mapping):
-            continue
-        expected_type = prop_schema.get("type")
-        if isinstance(expected_type, str) and not _matches_json_schema_type(arg_val, expected_type):
-            return (
-                False,
-                f"Argument '{arg_key}' failed type check: expected {expected_type}.",
-            )
-        if isinstance(expected_type, list) and not any(
-            isinstance(t, str) and _matches_json_schema_type(arg_val, t) for t in expected_type
-        ):
-            return (
-                False,
-                f"Argument '{arg_key}' failed union type check: expected one of {expected_type}.",
-            )
-        enum_values = prop_schema.get("enum")
-        if isinstance(enum_values, list) and arg_val not in enum_values:
-            return (
-                False,
-                f"Argument '{arg_key}' value is not in allowed enum {enum_values}.",
-            )
-
-    return True, None
+    return _validate_schema_node(parameters_schema, arguments, path="$")
 
 
 def extract_deterministic_tool_arguments(
@@ -159,11 +210,9 @@ def extract_deterministic_tool_arguments(
     if isinstance(properties, Mapping):
         for prop_name, prop_def in properties.items():
             if isinstance(prop_def, Mapping) and "default" in prop_def:
-                default_val = prop_def["default"]
-                expected_type = prop_def.get("type")
-                if not isinstance(expected_type, str) or _matches_json_schema_type(
-                    default_val, expected_type
-                ):
+                default_val = copy.deepcopy(prop_def["default"])
+                ok, _ = _validate_schema_node(prop_def, default_val, path=str(prop_name))
+                if ok:
                     extracted[str(prop_name)] = default_val
 
     valid, _reason = validate_tool_arguments_against_schema(schema, extracted)
@@ -525,11 +574,13 @@ class TurnEngine:
         if selected.disposition == CandidateDisposition.EXTERNAL_TOOL:
             assert selected.external_tool_name is not None
             call_id = _deterministic_tool_call_id(state.state_digest, selected.candidate_id)
+            safe_args = redact_mapping(selected.arguments)
             serialized_args = json.dumps(
-                selected.arguments,
+                safe_args,
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
+                allow_nan=False,
             )
             assistant_msg = AssistantMessageOutput(
                 role="assistant",
@@ -555,7 +606,8 @@ class TurnEngine:
             CandidateDisposition.GENERATION_JOB,
             CandidateDisposition.ASSISTANT_RESPONSE,
         ):
-            content = gen_result.content if gen_result is not None else selected.rationale
+            raw_content = gen_result.content if gen_result is not None else selected.rationale
+            content = redact_string(raw_content)
             if not content:
                 raise InvariantViolation("Assistant response candidate produced empty content.")
             assistant_msg = AssistantMessageOutput(
