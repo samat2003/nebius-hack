@@ -29,11 +29,12 @@ from alienese.providers.runtime.client import ProviderHttpClient
 NVIDIA_DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_NEMOTRON_SUPER_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 MAX_NVIDIA_GENERATION_TOKENS = 16_384
+ALLOWED_NVIDIA_HOSTS: frozenset[str] = frozenset({"integrate.api.nvidia.com"})
 
 
 def _is_valid_nvidia_host(hostname: str, *, allow_test_hosts: bool) -> bool:
     host = hostname.lower()
-    if host == "integrate.api.nvidia.com" or host.endswith(".api.nvidia.com"):
+    if host in ALLOWED_NVIDIA_HOSTS:
         return True
     return bool(allow_test_hosts and host in {"127.0.0.1", "localhost", "::1", "testserver"})
 

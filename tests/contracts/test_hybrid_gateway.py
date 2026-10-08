@@ -29,6 +29,10 @@ from alienese.api.app import create_app
 from alienese.api.errors import CompatibilityError
 from alienese.config import Settings
 from alienese.providers.fake import FakeGenerator
+from alienese.providers.generator.nebius_token_factory import (
+    NEBIUS_DEFAULT_BASE_URL,
+    NebiusTokenFactoryGenerator,
+)
 from alienese.providers.generator.nvidia_build import (
     NVIDIA_DEFAULT_BASE_URL,
     NVIDIA_NEMOTRON_SUPER_MODEL,
@@ -40,11 +44,15 @@ from alienese.providers.runtime.retry import RetryConfig
 
 async def test_fake_mode_with_populated_env_makes_zero_outbound_calls() -> None:
     cfg = Settings(
+        _env_file=None,
         alienese_provider_mode="fake",
         generator_provider="nvidia_build",
         generator_api_key=SecretStr("nvapi-" + ("a" * 16)),
         generator_base_url=NVIDIA_DEFAULT_BASE_URL,
         generator_model=NVIDIA_NEMOTRON_SUPER_MODEL,
+        nebius_token_factory_key=SecretStr("nebius-" + ("b" * 16)),
+        nebius_token_factory_base_url=NEBIUS_DEFAULT_BASE_URL,
+        nebius_token_factory_model=NVIDIA_NEMOTRON_SUPER_MODEL,
     )
     app = create_app(settings=cfg)
     assert isinstance(app.state.generator, FakeGenerator)
@@ -77,49 +85,93 @@ async def test_fake_mode_with_populated_env_makes_zero_outbound_calls() -> None:
             },
             "invalid_provider_mode_combination",
         ),
-        # 3. hybrid mode with missing generator_api_key
+        # 3. hybrid nvidia_build with missing generator_api_key (even if nebius key present)
         (
             {
                 "alienese_provider_mode": "hybrid",
                 "generator_provider": "nvidia_build",
                 "generator_api_key": None,
+                "nebius_token_factory_key": SecretStr("nebius-" + ("b" * 16)),
             },
             "missing_provider_api_key",
         ),
-        # 4. nvidia_build silently inheriting or configured with Nebius URL
+        # 4. hybrid nebius_token_factory missing nebius_token_factory_key (even if nvidia key set)
+        (
+            {
+                "alienese_provider_mode": "hybrid",
+                "generator_provider": "nebius_token_factory",
+                "generator_api_key": SecretStr("nvapi-" + ("a" * 16)),
+                "nebius_token_factory_key": None,
+            },
+            "missing_provider_api_key",
+        ),
+        # 5. nvidia_build configured with Nebius URL
         (
             {
                 "alienese_provider_mode": "hybrid",
                 "generator_provider": "nvidia_build",
                 "generator_api_key": SecretStr("nvapi-" + ("a" * 16)),
-                "generator_base_url": "https://api.tokenfactory.nebius.com/v1",
+                "generator_base_url": NEBIUS_DEFAULT_BASE_URL,
                 "generator_model": NVIDIA_NEMOTRON_SUPER_MODEL,
             },
             "provider_origin_mismatch",
         ),
-        # 5. nebius_token_factory reusing an NVIDIA nvapi-* key
+        # 6. nvidia_build configured with unallowlisted wildcard subdomain
+        (
+            {
+                "alienese_provider_mode": "hybrid",
+                "generator_provider": "nvidia_build",
+                "generator_api_key": SecretStr("nvapi-" + ("a" * 16)),
+                "generator_base_url": "https://untrusted.api.nvidia.com/v1",
+                "generator_model": NVIDIA_NEMOTRON_SUPER_MODEL,
+            },
+            "provider_origin_mismatch",
+        ),
+        # 7. nebius_token_factory reusing an NVIDIA nvapi-* key
         (
             {
                 "alienese_provider_mode": "hybrid",
                 "generator_provider": "nebius_token_factory",
-                "generator_api_key": SecretStr("nvapi-" + ("a" * 16)),
-                "generator_base_url": "https://api.tokenfactory.nebius.com/v1",
+                "nebius_token_factory_key": SecretStr("nvapi-" + ("a" * 16)),
+                "nebius_token_factory_base_url": NEBIUS_DEFAULT_BASE_URL,
+                "nebius_token_factory_model": NVIDIA_NEMOTRON_SUPER_MODEL,
+            },
+            "cross_provider_credential_reuse",
+        ),
+        # 8. nvidia_build reusing a Nebius key
+        (
+            {
+                "alienese_provider_mode": "hybrid",
+                "generator_provider": "nvidia_build",
+                "generator_api_key": SecretStr("nebius-" + ("b" * 16)),
+                "generator_base_url": NVIDIA_DEFAULT_BASE_URL,
                 "generator_model": NVIDIA_NEMOTRON_SUPER_MODEL,
             },
             "cross_provider_credential_reuse",
         ),
-        # 6. nebius_token_factory pointing to NVIDIA URL
+        # 9. nebius_token_factory pointing to NVIDIA URL
         (
             {
                 "alienese_provider_mode": "hybrid",
                 "generator_provider": "nebius_token_factory",
-                "generator_api_key": SecretStr("nebius-testSecretKey1234567890"),
-                "generator_base_url": NVIDIA_DEFAULT_BASE_URL,
-                "generator_model": NVIDIA_NEMOTRON_SUPER_MODEL,
+                "nebius_token_factory_key": SecretStr("nebius-" + ("b" * 16)),
+                "nebius_token_factory_base_url": NVIDIA_DEFAULT_BASE_URL,
+                "nebius_token_factory_model": NVIDIA_NEMOTRON_SUPER_MODEL,
             },
             "provider_origin_mismatch",
         ),
-        # 7. non-fake retriever_provider in Phase 2
+        # 10. nebius_token_factory pointing to unallowlisted wildcard subdomain
+        (
+            {
+                "alienese_provider_mode": "hybrid",
+                "generator_provider": "nebius_token_factory",
+                "nebius_token_factory_key": SecretStr("nebius-" + ("b" * 16)),
+                "nebius_token_factory_base_url": "https://untrusted.nebius.com/v1",
+                "nebius_token_factory_model": NVIDIA_NEMOTRON_SUPER_MODEL,
+            },
+            "provider_origin_mismatch",
+        ),
+        # 11. non-fake retriever_provider in Phase 2
         (
             {
                 "alienese_provider_mode": "hybrid",
@@ -129,7 +181,7 @@ async def test_fake_mode_with_populated_env_makes_zero_outbound_calls() -> None:
             },
             "invalid_provider_mode_combination",
         ),
-        # 8. non-fake controller_provider in Phase 2
+        # 12. non-fake controller_provider in Phase 2
         (
             {
                 "alienese_provider_mode": "hybrid",
@@ -146,7 +198,7 @@ def test_invalid_provider_mode_combinations_fail_before_serving(
     expected_code: str,
 ) -> None:
     with pytest.raises(CompatibilityError) as exc_info:
-        Settings(**kwargs)
+        Settings(_env_file=None, **kwargs)
     assert exc_info.value.code == expected_code
 
 
@@ -449,4 +501,99 @@ async def test_duplicate_idempotent_waiter_timeout_does_not_cancel_slow_leader()
         assert replay_resp.json() == leader_resp.json()
         assert upstream_calls == 1
 
+    await gen.aclose()
+
+
+async def test_nebius_hybrid_gateway_turn_uses_nebius_key_and_never_transmits_nvidia_key() -> None:
+    nvidia_secret = "nvapi-" + ("a" * 16)
+    nebius_secret = "nebius-" + ("b" * 16)
+    seen_auth_headers: list[str | None] = []
+    seen_urls: list[str] = []
+
+    async def nebius_mock(request: httpx.Request) -> httpx.Response:
+        seen_auth_headers.append(request.headers.get("authorization"))
+        seen_urls.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "x-request-id": "nebius-req-mock-01",
+            },
+            content=json.dumps(
+                {
+                    "id": "chatcmpl-neb-01",
+                    "object": "chat.completion",
+                    "model": NVIDIA_NEMOTRON_SUPER_MODEL,
+                    "system_fingerprint": "vllm-0.1.dev1+g5001743e3-dp2-9bbaa064",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "Nebius Token Factory synthesized this response.",
+                                "reasoning": None,
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 22,
+                        "completion_tokens": 8,
+                        "total_tokens": 30,
+                    },
+                }
+            ).encode("utf-8"),
+        )
+
+    cfg = Settings(
+        _env_file=None,
+        alienese_provider_mode="hybrid",
+        generator_provider="nebius_token_factory",
+        generator_api_key=SecretStr(nvidia_secret),
+        generator_base_url=NVIDIA_DEFAULT_BASE_URL,
+        generator_model=NVIDIA_NEMOTRON_SUPER_MODEL,
+        nebius_token_factory_key=SecretStr(nebius_secret),
+        nebius_token_factory_base_url=NEBIUS_DEFAULT_BASE_URL,
+        nebius_token_factory_model=NVIDIA_NEMOTRON_SUPER_MODEL,
+    )
+    assert cfg.effective_generator_api_key == SecretStr(nebius_secret)
+    assert cfg.effective_generator_base_url == NEBIUS_DEFAULT_BASE_URL
+    assert cfg.effective_generator_model == NVIDIA_NEMOTRON_SUPER_MODEL
+    safe_cfg_str = json.dumps(cfg.safe_dump())
+    assert nvidia_secret not in safe_cfg_str
+    assert nebius_secret not in safe_cfg_str
+
+    assert cfg.effective_generator_api_key is not None
+    http_client = ProviderHttpClient(
+        provider_name="nebius_token_factory",
+        base_url=cfg.effective_generator_base_url,
+        api_key=cfg.effective_generator_api_key,
+        retry_config=RetryConfig(max_attempts=1),
+        transport=httpx.MockTransport(nebius_mock),
+    )
+    gen = NebiusTokenFactoryGenerator(
+        http_client=http_client,
+        model_id=cfg.effective_generator_model,
+    )
+    app = create_app(settings=cfg, generator=gen)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "alienese-default",
+                "messages": [{"role": "user", "content": "Verify Nebius credential isolation."}],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == "alienese-default"
+    assert (
+        body["choices"][0]["message"]["content"]
+        == "Nebius Token Factory synthesized this response."
+    )
+    assert seen_urls == [f"{NEBIUS_DEFAULT_BASE_URL}/chat/completions"]
+    assert seen_auth_headers == [f"Bearer {nebius_secret}"]
+    assert nvidia_secret not in str(seen_auth_headers)
     await gen.aclose()

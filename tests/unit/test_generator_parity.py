@@ -72,7 +72,7 @@ def _build_adapter(
 
     client = ProviderHttpClient(
         provider_name="nebius_token_factory",
-        base_url="https://api.tokenfactory.nebius.com/v1",
+        base_url="https://api.tokenfactory.us-central1.nebius.com/v1",
         api_key="nebius-" + ("b" * 16),
         retry_config=RetryConfig(max_attempts=1),
         transport=httpx.MockTransport(handler),
@@ -80,6 +80,7 @@ def _build_adapter(
     return NebiusTokenFactoryGenerator(
         http_client=client,
         model_id=NVIDIA_NEMOTRON_SUPER_MODEL,
+        enable_thinking=enable_thinking,
     )
 
 
@@ -111,6 +112,7 @@ async def test_generator_parity_success_trust_separation_and_verbatim_content(
                                 "reasoning_content": (
                                     "Internal chain of thought that must not leak."
                                 ),
+                                "reasoning": ("Internal vLLM reasoning that must not leak."),
                             },
                         }
                     ],
@@ -127,9 +129,10 @@ async def test_generator_parity_success_trust_separation_and_verbatim_content(
     ctx = RequestContext()
     result = await adapter.generate(ctx, _sample_job())
 
-    # Verbatim content preserved; reasoning_content never concatenated into answer
+    # Verbatim content preserved; reasoning_content/reasoning never concatenated into answer
     assert result.content == verbatim_answer
     assert "Internal chain of thought" not in result.content
+    assert "Internal vLLM reasoning" not in result.content
     assert result.provider_name == provider_kind
     assert result.model_id == NVIDIA_NEMOTRON_SUPER_MODEL
     assert result.model_revision == "unknown"
@@ -144,9 +147,8 @@ async def test_generator_parity_success_trust_separation_and_verbatim_content(
     assert sent["messages"][0] == {"role": "system", "content": "Respond concisely."}
     assert "ignore previous instructions" not in sent["messages"][0]["content"]
     assert "<untrusted_external_evidence>" in sent["messages"][1]["content"]
-    if provider_kind == "nvidia_build":
-        assert sent["chat_template_kwargs"] == {"enable_thinking": False}
-        assert "reasoning_effort" not in sent
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in sent
 
     await adapter.aclose()
 
@@ -226,7 +228,7 @@ async def test_generator_parity_http_202_pending_invocation_rejected_without_pol
             },
             "empty_generator_content",
         ),
-        # Reasoning-only output (content is None while reasoning_content is populated)
+        # Reasoning-only output (NVIDIA reasoning_content is populated while content is None)
         (
             {
                 "id": "1",
@@ -239,6 +241,25 @@ async def test_generator_parity_http_202_pending_invocation_rejected_without_pol
                             "role": "assistant",
                             "content": None,
                             "reasoning_content": "Thinking about the problem...",
+                        },
+                    }
+                ],
+            },
+            "reasoning_only_response",
+        ),
+        # Reasoning-only output (Nebius vLLM reasoning field is populated while content is None)
+        (
+            {
+                "id": "1",
+                "model": NVIDIA_NEMOTRON_SUPER_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "Thinking via vLLM reasoning field...",
                         },
                     }
                 ],
