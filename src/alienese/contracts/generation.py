@@ -51,7 +51,7 @@ class GenerationSemantics(BaseModel):
     structured_arguments: dict[str, Any] | None = None
     provider_name: str = Field(min_length=1)
     model_id: str = Field(min_length=1)
-    model_revision: str = Field(default="fake-v1", min_length=1)
+    model_revision: str = Field(default="unknown", min_length=1)
 
 
 class GenerationResult(BaseModel):

@@ -63,6 +63,7 @@ class RequestContext(BaseModel):
     correlation_trace_id: str = Field(default_factory=generate_correlation_trace_id)
     traceparent: str | None = None
     idempotency_key: str | None = None
+    deadline_monotonic: float | None = Field(default=None, gt=0.0)
 
     @field_validator("traceparent")
     @classmethod
@@ -77,3 +78,7 @@ class RequestContext(BaseModel):
     def with_operation_id(self, operation_id: str) -> RequestContext:
         """Return a copy bound to an existing logical operation_id (for idempotent retries)."""
         return self.model_copy(update={"operation_id": operation_id})
+
+    def with_deadline_monotonic(self, deadline_monotonic: float) -> RequestContext:
+        """Return a copy bound to a monotonic turn deadline timestamp."""
+        return self.model_copy(update={"deadline_monotonic": deadline_monotonic})

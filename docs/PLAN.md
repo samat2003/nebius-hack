@@ -45,27 +45,29 @@ Restarting the service must not lose correctness.
 
 ---
 
-## Phase 2 — Provider runtime
+## Phase 2 — Provider runtime (Completed)
 
-Implement a shared remote-provider execution layer with:
+Implement a shared remote-provider execution layer (`src/alienese/providers/runtime/`) with:
 
-- deadlines;
-- bounded retry;
-- circuit breaker;
-- per-provider concurrency limits;
-- normalized errors;
-- usage/cost extraction;
+- end-to-end turn deadlines (`RequestContext.deadline_monotonic` + `DeadlineBudget`);
+- safe-to-retry vs. ambiguous-completion bounded retry (`RetryConfig`);
+- per-attempt circuit breaker with single-probe `HALF_OPEN` admission (`ProviderCircuitBreaker`);
+- per-provider concurrency and waiter queue limits (`ProviderConcurrencyLimiter`);
+- pre-allocation outbound JSON depth/byte caps and streaming response byte caps (`ProviderHttpClient`);
+- origin-scoped HTTPS credentials (`follow_redirects=False`, `trust_env=False`);
+- normalized errors and truthful nullable usage/cost extraction (`ProviderCallTelemetry`);
 - tracing.
 
 Add provider adapters for:
 
-- EmbeddingGemma 2;
-- mini-Jev;
-- NVIDIA Nemotron through Nebius Token Factory.
+- NVIDIA Nemotron 3 Super through NVIDIA API Catalog (`NvidiaBuildGenerator`, `LIVE_VERIFIED`);
+- NVIDIA Nemotron through Nebius Token Factory (`NebiusTokenFactoryGenerator`, `PENDING_CREDENTIALS` / `MOCK_VERIFIED`);
+- EmbeddingGemma 2 (`EmbeddingGemmaRetriever`, `BLOCKED_HOSTING` / `MOCK_VERIFIED`);
+- `samatv256/mini-Jev` pinned at `step-010626` (`MiniJevController`, `BLOCKED_HOSTING` / `MOCK_VERIFIED`).
 
 ### Quality gate
 
-Fault tests cover timeout, rate limit, 5xx, malformed responses, and unavailable optional providers.
+Fault tests cover timeout, deadline exhaustion, cancellation, rate limit (`429` + `Retry-After`), `5xx`, circuit-breaker single-probe `HALF_OPEN` recovery, oversized payloads, redirect rejection, malformed responses, and behavioral parity between `NvidiaBuildGenerator` and `NebiusTokenFactoryGenerator`. Default test suite runs 100% offline.
 
 ---
 

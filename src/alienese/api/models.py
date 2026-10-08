@@ -335,7 +335,7 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChoice]
-    usage: UsageInfo = Field(default_factory=UsageInfo)
+    usage: UsageInfo | None = None
     system_fingerprint: str | None = None
 
 

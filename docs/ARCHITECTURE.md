@@ -258,7 +258,7 @@ Guarded mode uses score margin, entropy, risk, loop state, and deterministic pol
 
 ## 10. Generator
 
-Nemotron through Nebius Token Factory handles open-ended synthesis.
+Nemotron (`nvidia/nemotron-3-super-120b-a12b` via NVIDIA API Catalog in Phase 2, with config-switchable portability to Nebius Token Factory via `NebiusTokenFactoryGenerator`) handles open-ended synthesis.
 
 It receives typed GenerationJobs rather than a generic autonomous-agent prompt.
 
@@ -270,7 +270,7 @@ Examples:
 - synthesize a new search hypothesis;
 - produce the final user-facing answer.
 
-Generator output is structurally validated. Semantic correctness is ultimately established through subsequent harness execution and verification.
+Generator output is structurally validated (single choice, `finish_reason="stop"`, non-empty `content`, rejection of reasoning-only completions, and trust-boundary separation of `selected_evidence`). Semantic correctness is ultimately established through subsequent harness execution and verification.
 
 ## 11. Deterministic guards
 
@@ -285,15 +285,18 @@ Examples:
 
 ## 12. Reliability
 
-Each remote provider is wrapped by a shared provider runtime with:
+Each remote provider is wrapped by the shared provider runtime (`src/alienese/providers/runtime/`) with:
 
-- timeout;
-- one bounded retry where appropriate;
-- circuit breaker;
-- concurrency semaphore;
-- usage extraction;
-- normalized errors;
-- tracing.
+- end-to-end turn deadline propagation (`RequestContext.deadline_monotonic` + `DeadlineBudget`);
+- safe-to-retry (`ConnectError`, `ConnectTimeout`, HTTP `408`/`429`/`500`/`502`/`503`/`504`) vs. ambiguous-completion (`ReadTimeout`, `WriteTimeout`, `RemoteProtocolError`) separation;
+- per-attempt circuit breaker (`CLOSED`, `OPEN`, single-probe `HALF_OPEN`) that excludes local concurrency saturation (`PoolTimeout`) and HTTP `429` throttling from outage counters;
+- bounded concurrency semaphore and waiter queue admission;
+- pre-allocation outbound JSON depth/byte caps and incremental streaming response byte caps;
+- origin-scoped HTTPS credentials (`follow_redirects=False`, `trust_env=False`);
+- truthful nullable token/cost extraction (`None` when unmeasured);
+- normalized errors and tracing.
+
+See [docs/providers/compatibility-matrix.md](providers/compatibility-matrix.md) and [docs/adr/0002-remote-provider-runtime-and-telemetry.md](adr/0002-remote-provider-runtime-and-telemetry.md).
 
 Expected degradation:
 
