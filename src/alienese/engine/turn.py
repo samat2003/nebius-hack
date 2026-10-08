@@ -74,7 +74,6 @@ from alienese.observability.tracing import RuntimeTracer
 from alienese.providers.runtime.deadlines import (
     DEFAULT_TURN_TIMEOUT_SECONDS,
     DeadlineBudget,
-    ensure_context_deadline,
 )
 from alienese.storage.traces import TraceStore, sanitize_replay_artifact
 
@@ -747,6 +746,16 @@ class TurnEngine:
         self._turn_timeout_seconds = turn_timeout_seconds
         self._monotonic_clock: Callable[[], float] = monotonic_clock or time.monotonic
 
+    @property
+    def turn_timeout_seconds(self) -> float:
+        """Maximum duration in seconds for a logical turn execution."""
+        return self._turn_timeout_seconds
+
+    @property
+    def monotonic_clock(self) -> Callable[[], float]:
+        """Monotonic clock callable used by this engine."""
+        return self._monotonic_clock
+
     async def _maybe_rank_candidates(
         self,
         ctx: RequestContext,
@@ -767,11 +776,9 @@ class TurnEngine:
         request: ChatCompletionRequest,
     ) -> tuple[ChatCompletionResponse, ReplayArtifact]:
         """Run a single turn from request normalization to response serialization."""
-        ctx = ensure_context_deadline(
-            ctx,
-            timeout_seconds=self._turn_timeout_seconds,
-            clock=self._monotonic_clock,
-        )
+        turn_limit_deadline = self._monotonic_clock() + self._turn_timeout_seconds
+        if ctx.deadline_monotonic is None or turn_limit_deadline < ctx.deadline_monotonic:
+            ctx = ctx.model_copy(update={"deadline_monotonic": turn_limit_deadline})
         deadline = DeadlineBudget.from_context(
             ctx,
             default_timeout_seconds=self._turn_timeout_seconds,

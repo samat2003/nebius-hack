@@ -85,6 +85,18 @@ class Settings(BaseSettings):
         gt=0.0,
         validation_alias="ALIENESE_IDEMPOTENCY_TTL_SECONDS",
     )
+    idempotency_wait_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=300.0,
+        validation_alias="ALIENESE_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS",
+    )
+    request_deadline_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=300.0,
+        validation_alias="ALIENESE_REQUEST_DEADLINE_SECONDS",
+    )
     trace_store_max_entries: int = Field(
         default=1024,
         ge=1,

@@ -345,7 +345,7 @@ class EmbeddingGemmaRetriever:
                 for pos, item_id in enumerate(expected_item_ids)
             }
 
-        raw_rev = data.get("model_revision") or data.get("system_fingerprint")
+        raw_rev = data.get("model_revision")
         revision = raw_rev.strip() if isinstance(raw_rev, str) and raw_rev.strip() else "unknown"
         return query_norm, item_norms, revision
 

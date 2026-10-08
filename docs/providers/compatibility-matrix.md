@@ -23,7 +23,7 @@ This document records the verification status, capability coverage, and measured
 | Generator | `nvidia_build` | `nvidia/nemotron-3-super-120b-a12b` | `https://integrate.api.nvidia.com/v1` | `LIVE_VERIFIED` | `hybrid` |
 | Generator | `nebius_token_factory` | Explicit `GENERATOR_MODEL` required | `https://api.tokenfactory.nebius.com/v1` | `PENDING_CREDENTIALS` (`MOCK_VERIFIED`) | `hybrid` (when Nebius credentials supplied) |
 | Retriever | `fake` | `google/embeddinggemma-2` | In-process | `MOCK_VERIFIED` | `fake`, `hybrid` |
-| Retriever | `embeddinggemma` (`EmbeddingGemmaRetriever`) | `google/embeddinggemma-300m` | Configured HTTPS origin | `BLOCKED_HOSTING` (`MOCK_VERIFIED`) | Direct adapter unit tests (Phase 6 runtime enablement) |
+| Retriever | `embeddinggemma` (`EmbeddingGemmaRetriever`) | `google/embeddinggemma-2` | Configured HTTPS origin | `BLOCKED_HOSTING` (`MOCK_VERIFIED`) | Direct adapter unit tests (Phase 6 runtime enablement) |
 | Controller | `fake` | `samatv256/mini-Jev` | In-process | `MOCK_VERIFIED` | `fake`, `hybrid` |
 | Controller | `mini_jev` (`MiniJevController`) | `samatv256/mini-Jev` (`step-010626` / `3a1d1d19d85e9863146307fe4b769e8bbe242c4e`) | Configured HTTPS origin | `BLOCKED_HOSTING` (`MOCK_VERIFIED`) | Direct adapter unit tests (Phase 4/5 runtime enablement) |
 
@@ -35,20 +35,20 @@ This document records the verification status, capability coverage, and measured
 | --- | --- | --- | --- | --- |
 | Non-streaming JSON request/response | `LIVE_VERIFIED` | `MOCK_VERIFIED` (`PENDING_CREDENTIALS`) | `MOCK_VERIFIED` (`BLOCKED_HOSTING`) | `MOCK_VERIFIED` (`BLOCKED_HOSTING`) |
 | Streaming (`stream=true`) | `UNSUPPORTED` | `UNSUPPORTED` | `UNSUPPORTED` | `UNSUPPORTED` |
-| End-to-end `RequestContext.deadline_monotonic` enforcement | `LIVE_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
+| End-to-end `RequestContext.deadline_monotonic` enforcement | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
 | Safe-to-retry vs. ambiguous-failure retry separation | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
 | Per-attempt circuit breaker (`CLOSED` / `OPEN` / `HALF_OPEN` single-probe) | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
-| Bounded concurrency + waiter queue admission | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
-| Pre-allocation JSON depth & byte caps (`max_request_bytes`, `max_response_bytes`) | `LIVE_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
-| Origin-scoped auth (`follow_redirects=False`, `trust_env=False`, HTTPS required) | `LIVE_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
+| Bounded per-attempt concurrency (permit released during retry backoff) | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
+| Pre-allocation JSON depth, raw byte caps (`max_request_bytes`, `max_response_bytes`), & `Accept-Encoding: identity` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
+| Origin-scoped auth (`follow_redirects=False`, `trust_env=False`, HTTPS required) | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
 | Reasoning suppression (`chat_template_kwargs={"enable_thinking": false}`) | `LIVE_VERIFIED` | N/A | N/A | N/A |
 | Reasoning-only / empty `content` rejection (`InvalidProviderResponse`) | `MOCK_VERIFIED` | `MOCK_VERIFIED` | N/A | N/A |
-| HTTP `202 Accepted` pending invocation fail-fast (`ProviderTimeout`) | `MOCK_VERIFIED` | N/A | N/A | N/A |
+| HTTP `202 Accepted` pending invocation fail-fast (`ProviderUnavailable`) | `MOCK_VERIFIED` | N/A | N/A | N/A |
 | Matryoshka truncation (`768`/`512`/`256`/`128`) + L2 renormalization | N/A | N/A | `MOCK_VERIFIED` | N/A |
 | Mandatory item preservation (`mandatory=True`) | N/A | N/A | `MOCK_VERIFIED` | N/A |
 | Single-candidate deterministic bypass (0 network calls) | N/A | N/A | N/A | `MOCK_VERIFIED` |
 | Probability simplex & `selected_id` argmax verification | N/A | N/A | N/A | `MOCK_VERIFIED` |
-| Nullable token/cost telemetry (`estimated_cost_usd=None` when unverified) | `LIVE_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
+| Nullable token/cost telemetry (`estimated_cost_usd=None` when unverified) & `serving_fingerprint` vs. `model_revision="unknown"` | `LIVE_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` | `MOCK_VERIFIED` |
 
 ---
 
@@ -58,7 +58,7 @@ This document records the verification status, capability coverage, and measured
 
 - **Timestamp (UTC)**: `2026-10-08T15:10:03.614180+00:00`
 - **Endpoint Hostname**: `integrate.api.nvidia.com` (`POST /v1/chat/completions`)
-- **Requested & Reported Model**: `nvidia/nemotron-3-super-120b-a12b`
+- **Requested & Reported Model**: `nvidia/nemotron-3-super-120b-a12b` (`model_revision="unknown"`, `system_fingerprint` recorded as `ProviderCallTelemetry.serving_fingerprint`)
 - **Request Parameters**: `max_tokens=64`, `temperature=1.0`, `top_p=0.95`, `stream=False`, `chat_template_kwargs={"enable_thinking": False}`
 - **HTTP Status**: `200 OK` (`nvcf-status: fulfilled`)
 - **Upstream Request ID Header**: `nvcf-reqid: 0684d371-d4c8-42ad-90cf-6c1fee135bd6`
@@ -85,3 +85,4 @@ This document records the verification status, capability coverage, and measured
 - **Provider Mode**: `ALIENESE_PROVIDER_MODE=hybrid`, `GENERATOR_PROVIDER=nvidia_build`, `RETRIEVER_PROVIDER=fake`, `CONTROLLER_PROVIDER=fake`
 - **Budget Governance**: `MAX_LIVE_REQUESTS=2` (executed `1`), `MAX_OUTPUT_TOKENS_PER_REQUEST=64`, `MAX_ATTEMPTS_PER_REQUEST=1`, `MAX_TEST_DURATION_SECONDS=30.0`
 - **Result**: `1 passed` (`HTTP 200`, `model="alienese-default"`, `finish_reason="stop"`, non-empty `choices[0].message.content`, populated `usage`, `TraceMode.METADATA_ONLY` artifact verified free of secrets).
+

@@ -16,24 +16,28 @@ To satisfy Invariants 7, 8, 9, and 14 in `AGENTS.md` without altering the core P
 
 ## Decisions
 
-### 1. Operational `deadline_monotonic` on `RequestContext`
+### 1. Three-Tier Deadline Contract & Operational `deadline_monotonic` on `RequestContext`
 
 - `RequestContext` includes an optional `deadline_monotonic: float | None = Field(default=None, exclude=True)`.
-- `TurnEngine.execute_turn()` initializes `deadline_monotonic` at turn start when not already set by the caller.
-- `DeadlineBudget` computes remaining budget from `ctx.deadline_monotonic` across concurrency slot acquisition, HTTP connection/read timeouts, and retry backoff scheduling. No new call or retry may begin once the deadline is exhausted.
+- Three distinct deadline scopes are enforced:
+  1. **Incoming HTTP request deadline** (`request_deadline_seconds`): established in `POST /v1/chat/completions` before reading the incremental ASGI request body stream (`request.stream()`) and before `IdempotencyCoordinator.execute()`.
+  2. **Duplicate idempotent waiter deadline** (`idempotency_wait_timeout_seconds` bounded by the incoming HTTP request deadline): bounds how long a concurrent duplicate request waits on the per-key lock. If exhausted, the duplicate waiter fails with `ProviderTimeout(code="idempotency_wait_timeout", status_code=504)` without cancelling the in-flight original leader operation.
+  3. **Logical turn execution deadline** (`turn_timeout_seconds` bounded by the leader's incoming deadline): `TurnEngine.execute_turn()` caps `ctx.deadline_monotonic` to `min(ctx.deadline_monotonic, now + turn_timeout_seconds)`. `DeadlineBudget` enforces this budget across concurrency slot acquisition, HTTP connection/read timeouts, and retry backoff scheduling.
 - Because `RequestContext` is operational metadata (and `deadline_monotonic` is excluded from serialization), `WorkingState.state_digest` and `ReplaySemantics` equality remain strictly deterministic and unaffected by wall-clock or monotonic deadlines.
 
-### 2. Nullable Token and Cost Fields in `ProviderCallTelemetry` and `ChatCompletionResponse`
+### 2. Nullable Token/Cost Fields and `serving_fingerprint` vs. `model_revision`
 
-- `ProviderCallTelemetry` fields `prompt_tokens`, `completion_tokens`, `total_tokens`, `retried_prompt_tokens`, `retried_completion_tokens`, and `estimated_cost_usd` default to `None` rather than `0` / `0.0`.
-- `ProviderCallTelemetry` records `attempt_count`, `failed_attempt_count`, and `upstream_request_id` (`nvcf-reqid` / `x-request-id`).
-- `ChatCompletionResponse.usage` is `UsageInfo | None = None`: it is populated when the generator reports valid integer token counts and `None` when token usage is unknown (such as in `fake` provider mode or when an upstream response omits `usage`).
+- `ProviderCallTelemetry` fields `prompt_tokens`, `completion_tokens`, `total_tokens`, `retried_prompt_tokens`, `retried_completion_tokens`, `estimated_cost_usd`, and `serving_fingerprint` default to `None` rather than `0` / `0.0`.
+- `ProviderCallTelemetry` records `attempt_count`, `failed_attempt_count`, `upstream_request_id` (`nvcf-reqid` / `x-request-id`), and `serving_fingerprint` (extracted from OpenAI-compatible `system_fingerprint`).
+- `GenerationResult.model_revision` and `RetrievalResult.model_revision` are populated only when an explicit `model_revision` is reported by the provider; otherwise they remain `"unknown"` (never conflated with `system_fingerprint`).
+- `ChatCompletionResponse.usage` is `UsageInfo | None = None`: it is populated when the generator reports valid integer token counts and `None` when token usage is unknown.
 
-### 3. Safe-to-Retry vs. Ambiguous-Completion Classification & Circuit-Breaker Accounting
+### 3. Per-Attempt Concurrency Permits, Raw Byte Limits, and Circuit-Breaker Accounting
 
-- `ProviderHttpClient` classifies failures into `SAFE_RETRYABLE_TRANSPORT` (`ConnectError`, `ConnectTimeout`), `SAFE_RETRYABLE_UPSTREAM` (HTTP `408`, `500`, `502`, `503`, `504`), `RATE_LIMITED` (HTTP `429`), `AMBIGUOUS_COMPLETION` (`ReadTimeout`, `WriteTimeout`, `RemoteProtocolError`), `LOCAL_SATURATION` (`PoolTimeout`, local concurrency queue timeout), and `NON_RETRYABLE_CONTRACT` (`400`, `401`, `403`, `404`, `422`, malformed JSON/schema).
-- By default (`retry_ambiguous_failures=False`), `AMBIGUOUS_COMPLETION` errors fail fast without automatic retry.
-- `ProviderCircuitBreaker` counts each failed upstream outage attempt (`SAFE_RETRYABLE_UPSTREAM` and `AMBIGUOUS_COMPLETION`), excludes `LOCAL_SATURATION` and `RATE_LIMITED` (`429`), and admits at most one concurrent probe (`half_open_max_probes=1`) in `HALF_OPEN` state.
+- `ProviderConcurrencyLimiter.acquire(deadline)` wraps each individual upstream HTTP attempt rather than the outer retry loop, ensuring retry backoff (`Retry-After` or exponential backoff) never holds an active provider concurrency slot.
+- `ProviderHttpClient` sends `Accept-Encoding: identity`, rejects unsolicited compressed `Content-Encoding` headers (`code="unsupported_content_encoding"`), and reads response streams via `response.aiter_raw()` so `max_response_bytes` is enforced before any decompression expansion.
+- `ProviderHttpClient` classifies failures into `SAFE_RETRYABLE_TRANSPORT`, `SAFE_RETRYABLE_UPSTREAM`, `RATE_LIMITED` (`429`), `AMBIGUOUS_COMPLETION` (`ReadTimeout`, `WriteTimeout`, `RemoteProtocolError`), `LOCAL_SATURATION` (`PoolTimeout`, local concurrency queue timeout), and `NON_RETRYABLE_CONTRACT`. By default (`retry_ambiguous_failures=False`), `AMBIGUOUS_COMPLETION` errors fail fast without automatic retry.
+- `ProviderCircuitBreaker` checks admission before every attempt (including retries), counts each failed upstream outage attempt, excludes `LOCAL_SATURATION` and `RATE_LIMITED` (`429`), and admits at most one concurrent probe (`half_open_max_probes=1`) in `HALF_OPEN` state.
 
 ### 4. Explicit Provider Mode Matrix
 
@@ -45,4 +49,5 @@ To satisfy Invariants 7, 8, 9, and 14 in `AGENTS.md` without altering the core P
 
 - Default `pytest` execution remains 100% offline and deterministic even on developer workstations with `.env` populated.
 - Switching between `nvidia_build` and `nebius_token_factory` requires only configuration changes (`GENERATOR_PROVIDER`, `GENERATOR_API_KEY`, `GENERATOR_BASE_URL`, `GENERATOR_MODEL`) with zero changes to `TurnEngine`, `WorkingState`, or the public OpenAI-compatible API.
-- Telemetry artifacts never fabricate zero token usage or zero USD cost when measurements are unavailable.
+- Telemetry artifacts never fabricate zero token usage, zero USD cost, or fake model revisions when measurements are unavailable.
+

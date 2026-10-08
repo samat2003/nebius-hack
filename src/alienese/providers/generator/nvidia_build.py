@@ -168,8 +168,8 @@ def parse_and_validate_chat_completion(
             code="empty_generator_content",
         )
 
-    raw_fp = data.get("system_fingerprint")
-    revision = raw_fp.strip() if isinstance(raw_fp, str) and raw_fp.strip() else "unknown"
+    raw_rev = data.get("model_revision")
+    revision = raw_rev.strip() if isinstance(raw_rev, str) and raw_rev.strip() else "unknown"
     return raw_content, revision
 
 

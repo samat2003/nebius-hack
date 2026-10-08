@@ -132,7 +132,8 @@ async def test_generator_parity_success_trust_separation_and_verbatim_content(
     assert "Internal chain of thought" not in result.content
     assert result.provider_name == provider_kind
     assert result.model_id == NVIDIA_NEMOTRON_SUPER_MODEL
-    assert result.model_revision == "fp_rev_2026"
+    assert result.model_revision == "unknown"
+    assert result.telemetry.serving_fingerprint == "fp_rev_2026"
     assert result.telemetry.prompt_tokens == 32
     assert result.telemetry.completion_tokens == 14
     assert result.telemetry.total_tokens == 46

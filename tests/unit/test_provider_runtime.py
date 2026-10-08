@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 from collections.abc import AsyncIterator
 from email.utils import formatdate
@@ -34,6 +35,7 @@ from alienese.providers.runtime.circuit_breaker import CircuitState, ProviderCir
 from alienese.providers.runtime.client import ProviderHttpClient
 from alienese.providers.runtime.concurrency import ProviderConcurrencyLimiter
 from alienese.providers.runtime.deadlines import DeadlineBudget
+from alienese.providers.runtime.errors import FailureCategory
 from alienese.providers.runtime.retry import RetryConfig, parse_retry_after_seconds
 
 
@@ -546,4 +548,182 @@ async def test_8_retry_after_header_delta_and_http_date_within_deadline() -> Non
         await client.post_json(tight_ctx, "/chat/completions", {"model": "test"})
     assert exc_info.value.code == "retry_after_exceeds_deadline"
     assert len(clock.sleeps) == 1  # No second sleep occurred!
+    await client.aclose()
+
+
+async def test_9_concurrency_permit_released_during_retry_backoff_allows_other_request() -> None:
+    clock = FakeClock()
+    limiter = ProviderConcurrencyLimiter(
+        provider_name="nvidia_build",
+        max_concurrency=1,
+        max_queue_waiters=2,
+    )
+    req_a_sleeping = asyncio.Event()
+    release_req_a_sleep = asyncio.Event()
+    call_order: list[str] = []
+    req_a_attempts = 0
+
+    async def custom_sleep(delay: float) -> None:
+        clock.sleeps.append(delay)
+        # Permit MUST be released while Request A is sleeping in retry backoff
+        assert limiter.active_count == 0
+        req_a_sleeping.set()
+        await release_req_a_sleep.wait()
+        clock.advance(delay)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal req_a_attempts
+        body = json.loads(request.content.decode("utf-8"))
+        tag = body["req_tag"]
+        call_order.append(f"{tag}:attempt")
+        if tag == "A":
+            req_a_attempts += 1
+            if req_a_attempts == 1:
+                return httpx.Response(
+                    429,
+                    headers={"content-type": "application/json", "retry-after": "1.0"},
+                    content=b'{"error":"rate_limited"}',
+                )
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps({"ok": True, "tag": tag}).encode("utf-8"),
+        )
+
+    client = ProviderHttpClient(
+        provider_name="nvidia_build",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="nvapi-" + ("a" * 16),
+        retry_config=RetryConfig(max_attempts=2, base_delay_seconds=0.5),
+        concurrency_limiter=limiter,
+        transport=httpx.MockTransport(handler),
+        clock=clock.monotonic,
+        epoch_clock=clock.time,
+        sleep_func=custom_sleep,
+    )
+
+    ctx_a = RequestContext(deadline_monotonic=clock.monotonic() + 10.0)
+    ctx_b = RequestContext(deadline_monotonic=clock.monotonic() + 10.0)
+
+    task_a = asyncio.create_task(
+        client.post_json(ctx_a, "/chat/completions", {"model": "test", "req_tag": "A"})
+    )
+    await req_a_sleeping.wait()
+    assert limiter.active_count == 0
+
+    # Request B runs and completes while Request A is sleeping in backoff under max_concurrency=1
+    resp_b = await client.post_json(ctx_b, "/chat/completions", {"model": "test", "req_tag": "B"})
+    assert resp_b.status_code == 200
+    assert resp_b.data["tag"] == "B"
+
+    release_req_a_sleep.set()
+    resp_a = await task_a
+    assert resp_a.status_code == 200
+    assert resp_a.data["tag"] == "A"
+    assert call_order == ["A:attempt", "B:attempt", "A:attempt"]
+    assert limiter.active_count == 0
+    await client.aclose()
+
+
+async def test_10_retry_attempt_cannot_bypass_circuit_breaker_opened_during_backoff() -> None:
+    clock = FakeClock()
+    cb = ProviderCircuitBreaker(
+        provider_name="nvidia_build",
+        failure_threshold=2,
+        recovery_timeout_seconds=30.0,
+        clock=clock.monotonic,
+    )
+    upstream_attempts = 0
+
+    async def sleep_that_trips_breaker(delay: float) -> None:
+        clock.advance(delay)
+        # Another concurrent call trips the circuit breaker while this call is in backoff
+        cb.record_failure(FailureCategory.SAFE_RETRYABLE_UPSTREAM)
+        cb.record_failure(FailureCategory.SAFE_RETRYABLE_UPSTREAM)
+        assert cb.state == CircuitState.OPEN
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_attempts
+        upstream_attempts += 1
+        return httpx.Response(
+            429,
+            headers={"content-type": "application/json", "retry-after": "0.5"},
+            content=b'{"error":"rate_limited"}',
+        )
+
+    client = ProviderHttpClient(
+        provider_name="nvidia_build",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="nvapi-" + ("a" * 16),
+        retry_config=RetryConfig(max_attempts=3, base_delay_seconds=0.1),
+        circuit_breaker=cb,
+        transport=httpx.MockTransport(handler),
+        clock=clock.monotonic,
+        epoch_clock=clock.time,
+        sleep_func=sleep_that_trips_breaker,
+    )
+
+    ctx = RequestContext(deadline_monotonic=clock.monotonic() + 10.0)
+    with pytest.raises(ProviderUnavailable) as exc_info:
+        await client.post_json(ctx, "/chat/completions", {"model": "test"})
+
+    assert exc_info.value.code == "circuit_breaker_open"
+    assert upstream_attempts == 1  # Attempt 2 was blocked by the newly OPEN circuit breaker
+    await client.aclose()
+
+
+async def test_11_compressed_response_rejected_before_decompression_and_identity_enforced() -> None:
+    clock = FakeClock()
+    seen_accept_encodings: list[str | None] = []
+    # 50 KB uncompressed payload compressed to ~100 bytes with gzip
+    uncompressed_bomb = json.dumps({"data": "A" * 50_000}).encode("utf-8")
+    compressed_bomb = gzip.compress(uncompressed_bomb)
+    assert len(compressed_bomb) < 256
+
+    mode = "gzip_bomb"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_accept_encodings.append(request.headers.get("accept-encoding"))
+        if mode == "gzip_bomb":
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "application/json",
+                    "content-encoding": "gzip",
+                    "content-length": str(len(compressed_bomb)),
+                },
+                stream=_MultiChunkByteStream([compressed_bomb]),
+            )
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "identity",
+            },
+            stream=_MultiChunkByteStream([b'{"ok":true}']),
+        )
+
+    client = ProviderHttpClient(
+        provider_name="nvidia_build",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="nvapi-" + ("a" * 16),
+        max_response_bytes=512,
+        retry_config=RetryConfig(max_attempts=1),
+        transport=httpx.MockTransport(handler),
+        clock=clock.monotonic,
+    )
+    ctx = RequestContext(deadline_monotonic=clock.monotonic() + 10.0)
+
+    # 1. Compressed response is rejected before decompression despite small Content-Length
+    with pytest.raises(InvalidProviderResponse) as exc_info:
+        await client.post_json(ctx, "/chat/completions", {"model": "test"})
+    assert exc_info.value.code == "unsupported_content_encoding"
+    assert seen_accept_encodings == ["identity"]
+
+    # 2. Identity-encoded response succeeds within raw byte limit
+    mode = "identity_ok"
+    resp = await client.post_json(ctx, "/chat/completions", {"model": "test"})
+    assert resp.status_code == 200
+    assert resp.data == {"ok": True}
+    assert seen_accept_encodings == ["identity", "identity"]
     await client.aclose()

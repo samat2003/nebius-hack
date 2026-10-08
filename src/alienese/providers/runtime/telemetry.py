@@ -56,11 +56,20 @@ def extract_upstream_request_id(headers: Mapping[str, str]) -> str | None:
     return None
 
 
+def extract_serving_fingerprint(data: Mapping[str, Any]) -> str | None:
+    """Extract a sanitized operational `system_fingerprint` if present in response JSON."""
+    raw_fp = data.get("system_fingerprint")
+    if isinstance(raw_fp, str) and raw_fp.strip():
+        return redact_string(raw_fp.strip())[:128]
+    return None
+
+
 def build_provider_telemetry(
     *,
     latency_ms: float,
     request_attempt_id: str | None,
     upstream_request_id: str | None = None,
+    serving_fingerprint: str | None = None,
     attempt_count: int = 1,
     failed_attempt_count: int = 0,
     prompt_tokens: int | None = None,
@@ -75,6 +84,7 @@ def build_provider_telemetry(
         latency_ms=max(0.0, round(latency_ms, 3)),
         request_attempt_id=request_attempt_id,
         upstream_request_id=upstream_request_id,
+        serving_fingerprint=serving_fingerprint,
         attempt_count=max(1, attempt_count),
         failed_attempt_count=max(0, failed_attempt_count),
         prompt_tokens=prompt_tokens,

@@ -31,7 +31,7 @@ from alienese.api.errors import (
 from alienese.contracts.context import RequestContext
 from alienese.contracts.decisions import ProviderCallTelemetry
 from alienese.observability.logging import get_request_logger
-from alienese.providers.runtime.circuit_breaker import ProviderCircuitBreaker
+from alienese.providers.runtime.circuit_breaker import CircuitState, ProviderCircuitBreaker
 from alienese.providers.runtime.concurrency import ProviderConcurrencyLimiter
 from alienese.providers.runtime.deadlines import DEFAULT_TURN_TIMEOUT_SECONDS, DeadlineBudget
 from alienese.providers.runtime.errors import (
@@ -48,6 +48,7 @@ from alienese.providers.runtime.retry import (
 )
 from alienese.providers.runtime.telemetry import (
     build_provider_telemetry,
+    extract_serving_fingerprint,
     extract_upstream_request_id,
     parse_usage_dict,
 )
@@ -56,7 +57,15 @@ DEFAULT_MAX_REQUEST_BYTES = 262_144  # 256 KiB
 DEFAULT_MAX_RESPONSE_BYTES = 524_288  # 512 KiB
 DEFAULT_MAX_JSON_DEPTH = 24
 _ALLOWED_TEST_HTTP_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "testserver"})
-_ALLOWED_CONTENT_ENCODINGS = frozenset({"", "identity", "gzip", "deflate", "br", "zstd"})
+_ALLOWED_CONTENT_ENCODINGS = frozenset({"", "identity"})
+
+
+def _is_identity_content_encoding(raw_header: str) -> bool:
+    """Return True only if Content-Encoding is absent or strictly 'identity'."""
+    encodings = [part.strip().lower() for part in raw_header.split(",") if part.strip()]
+    if not encodings:
+        return True
+    return all(enc in _ALLOWED_CONTENT_ENCODINGS for enc in encodings)
 
 
 def _effective_port(scheme: str, port: int | None) -> int:
@@ -189,6 +198,7 @@ class ProviderHttpClient:
         )
 
         self._client = httpx.AsyncClient(
+            headers={"Accept-Encoding": "identity"},
             timeout=httpx.Timeout(default_timeout_seconds),
             limits=httpx.Limits(
                 max_connections=max_connections,
@@ -299,7 +309,7 @@ class ProviderHttpClient:
         response: httpx.Response,
         deadline: DeadlineBudget,
     ) -> bytes:
-        """Read response body incrementally enforcing `max_response_bytes` and `deadline`."""
+        """Read raw identity response stream enforcing `max_response_bytes` before decompression."""
         content_length_hdr = response.headers.get("content-length")
         if content_length_hdr is not None:
             try:
@@ -315,11 +325,16 @@ class ProviderHttpClient:
                 )
 
         buffer = bytearray()
-        async for chunk in response.aiter_bytes():
+        chunk_iter = (
+            response.aiter_raw() if not response.is_stream_consumed else response.aiter_bytes()
+        )
+        async for chunk in chunk_iter:
             deadline.require_remaining(
                 provider_name=self._provider_name,
                 phase="response_stream_read",
             )
+            if not chunk:
+                continue
             if len(buffer) + len(chunk) > self._max_response_bytes:
                 raise InvalidProviderResponse(
                     f"Provider '{self._provider_name}' response body exceeded maximum limit "
@@ -361,8 +376,18 @@ class ProviderHttpClient:
         retried_completion_tokens = 0
         has_retried_usage = False
 
-        async with self._concurrency.acquire(deadline):
-            for attempt_no in range(1, self._retry_config.max_attempts + 1):
+        for attempt_no in range(1, self._retry_config.max_attempts + 1):
+            deadline.require_remaining(
+                provider_name=self._provider_name,
+                phase=f"attempt_{attempt_no}_admission",
+            )
+            # Fail fast before waiting in concurrency queue if circuit is already OPEN
+            if self._circuit_breaker.state == CircuitState.OPEN:
+                self._circuit_breaker.before_attempt()
+
+            retry_delay: float | None = None
+
+            async with self._concurrency.acquire(deadline):
                 attempt_timeout = deadline.attempt_timeout_seconds(
                     self._attempt_timeout_seconds,
                     provider_name=self._provider_name,
@@ -374,6 +399,7 @@ class ProviderHttpClient:
                     "Authorization": f"Bearer {self._api_key.get_secret_value()}",
                     "Content-Type": "application/json",
                     "Accept": "application/json",
+                    "Accept-Encoding": "identity",
                     "X-Client-Request-ID": ctx.request_id,
                 }
                 req = self._client.build_request(
@@ -392,16 +418,17 @@ class ProviderHttpClient:
                     resp_headers = {k.lower(): v for k, v in response.headers.items()}
                     upstream_req_id = extract_upstream_request_id(resp_headers)
 
-                    content_encoding = resp_headers.get("content-encoding", "").strip().lower()
-                    if content_encoding not in _ALLOWED_CONTENT_ENCODINGS:
+                    content_encoding = resp_headers.get("content-encoding", "").strip()
+                    if not _is_identity_content_encoding(content_encoding):
                         self._circuit_breaker.record_failure(
                             FailureCategory.NON_RETRYABLE_CONTRACT,
                             was_half_open_probe=was_half_open_probe,
                         )
                         probe_accounted = True
                         raise InvalidProviderResponse(
-                            f"Provider '{self._provider_name}' returned unsupported "
-                            f"Content-Encoding '{content_encoding}'.",
+                            f"Provider '{self._provider_name}' returned unsolicited or "
+                            f"unsupported Content-Encoding '{content_encoding.lower()}'; "
+                            "only 'identity' is permitted.",
                             code="unsupported_content_encoding",
                         )
 
@@ -432,7 +459,7 @@ class ProviderHttpClient:
                             attempt_no=attempt_no,
                             config=self._retry_config,
                         ):
-                            delay = compute_retry_delay_seconds(
+                            retry_delay = compute_retry_delay_seconds(
                                 attempt_no=attempt_no,
                                 config=self._retry_config,
                                 retry_after_header=resp_headers.get("retry-after"),
@@ -445,103 +472,104 @@ class ProviderHttpClient:
                                 provider=self._provider_name,
                                 attempt_no=attempt_no,
                                 upstream_status=status_code,
-                                delay_seconds=round(delay, 3),
+                                delay_seconds=round(retry_delay, 3),
                             )
-                            await response.aclose()
-                            response = None
-                            await self._sleep(delay)
-                            continue
+                        else:
+                            raise map_http_status_to_error(
+                                provider_name=self._provider_name,
+                                status_code=status_code,
+                                upstream_request_id=upstream_req_id,
+                            )
+                    else:
+                        # HTTP 200 validation
+                        content_type = resp_headers.get("content-type", "").strip().lower()
+                        media_type = content_type.split(";", 1)[0].strip()
+                        if media_type != "application/json":
+                            self._circuit_breaker.record_failure(
+                                FailureCategory.NON_RETRYABLE_CONTRACT,
+                                was_half_open_probe=was_half_open_probe,
+                            )
+                            probe_accounted = True
+                            raise InvalidProviderResponse(
+                                f"Provider '{self._provider_name}' returned unsupported "
+                                f"Content-Type '{media_type or 'missing'}'; "
+                                "expected 'application/json'.",
+                                code="unsupported_media_type",
+                            )
 
-                        raise map_http_status_to_error(
-                            provider_name=self._provider_name,
-                            status_code=status_code,
+                        try:
+                            parsed_json = json.loads(raw_body.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            self._circuit_breaker.record_failure(
+                                FailureCategory.NON_RETRYABLE_CONTRACT,
+                                was_half_open_probe=was_half_open_probe,
+                            )
+                            probe_accounted = True
+                            raise InvalidProviderResponse(
+                                f"Provider '{self._provider_name}' returned malformed "
+                                "JSON response.",
+                                code="malformed_provider_json",
+                            ) from exc
+
+                        if not isinstance(parsed_json, dict):
+                            self._circuit_breaker.record_failure(
+                                FailureCategory.NON_RETRYABLE_CONTRACT,
+                                was_half_open_probe=was_half_open_probe,
+                            )
+                            probe_accounted = True
+                            raise InvalidProviderResponse(
+                                f"Provider '{self._provider_name}' response root must be "
+                                "a JSON object.",
+                                code="invalid_provider_response",
+                            )
+
+                        try:
+                            _validate_json_depth(parsed_json, max_depth=self._max_json_depth)
+                        except ValueError as exc:
+                            self._circuit_breaker.record_failure(
+                                FailureCategory.NON_RETRYABLE_CONTRACT,
+                                was_half_open_probe=was_half_open_probe,
+                            )
+                            probe_accounted = True
+                            raise InvalidProviderResponse(
+                                f"Provider '{self._provider_name}' response exceeded maximum "
+                                "JSON nesting depth.",
+                                code="response_json_depth_exceeded",
+                            ) from exc
+
+                        self._circuit_breaker.record_success(
+                            was_half_open_probe=was_half_open_probe,
+                        )
+                        probe_accounted = True
+
+                        elapsed_ms = (self._clock() - start_monotonic) * 1000.0
+                        prompt_tok, completion_tok, total_tok = parse_usage_dict(
+                            parsed_json.get("usage")
+                        )
+                        telemetry = build_provider_telemetry(
+                            latency_ms=elapsed_ms,
+                            request_attempt_id=ctx.request_id,
                             upstream_request_id=upstream_req_id,
+                            serving_fingerprint=extract_serving_fingerprint(parsed_json),
+                            attempt_count=attempt_no,
+                            failed_attempt_count=attempt_no - 1,
+                            prompt_tokens=prompt_tok,
+                            completion_tokens=completion_tok,
+                            total_tokens=total_tok,
+                            retried_prompt_tokens=(
+                                retried_prompt_tokens if has_retried_usage else None
+                            ),
+                            retried_completion_tokens=(
+                                retried_completion_tokens if has_retried_usage else None
+                            ),
+                            estimated_cost_usd=None,
                         )
-
-                    # HTTP 200 validation
-                    content_type = resp_headers.get("content-type", "").strip().lower()
-                    media_type = content_type.split(";", 1)[0].strip()
-                    if media_type != "application/json":
-                        self._circuit_breaker.record_failure(
-                            FailureCategory.NON_RETRYABLE_CONTRACT,
-                            was_half_open_probe=was_half_open_probe,
+                        return ProviderHttpResponse(
+                            data=parsed_json,
+                            headers=resp_headers,
+                            status_code=status_code,
+                            telemetry=telemetry,
                         )
-                        probe_accounted = True
-                        raise InvalidProviderResponse(
-                            f"Provider '{self._provider_name}' returned unsupported Content-Type "
-                            f"'{media_type or 'missing'}'; expected 'application/json'.",
-                            code="unsupported_media_type",
-                        )
-
-                    try:
-                        parsed_json = json.loads(raw_body.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                        self._circuit_breaker.record_failure(
-                            FailureCategory.NON_RETRYABLE_CONTRACT,
-                            was_half_open_probe=was_half_open_probe,
-                        )
-                        probe_accounted = True
-                        raise InvalidProviderResponse(
-                            f"Provider '{self._provider_name}' returned malformed JSON response.",
-                            code="malformed_provider_json",
-                        ) from exc
-
-                    if not isinstance(parsed_json, dict):
-                        self._circuit_breaker.record_failure(
-                            FailureCategory.NON_RETRYABLE_CONTRACT,
-                            was_half_open_probe=was_half_open_probe,
-                        )
-                        probe_accounted = True
-                        raise InvalidProviderResponse(
-                            f"Provider '{self._provider_name}' response root must be "
-                            "a JSON object.",
-                            code="invalid_provider_response",
-                        )
-
-                    try:
-                        _validate_json_depth(parsed_json, max_depth=self._max_json_depth)
-                    except ValueError as exc:
-                        self._circuit_breaker.record_failure(
-                            FailureCategory.NON_RETRYABLE_CONTRACT,
-                            was_half_open_probe=was_half_open_probe,
-                        )
-                        probe_accounted = True
-                        raise InvalidProviderResponse(
-                            f"Provider '{self._provider_name}' response exceeded maximum JSON "
-                            "nesting depth.",
-                            code="response_json_depth_exceeded",
-                        ) from exc
-
-                    self._circuit_breaker.record_success(
-                        was_half_open_probe=was_half_open_probe,
-                    )
-                    probe_accounted = True
-
-                    elapsed_ms = (self._clock() - start_monotonic) * 1000.0
-                    prompt_tok, completion_tok, total_tok = parse_usage_dict(
-                        parsed_json.get("usage")
-                    )
-                    telemetry = build_provider_telemetry(
-                        latency_ms=elapsed_ms,
-                        request_attempt_id=ctx.request_id,
-                        upstream_request_id=upstream_req_id,
-                        attempt_count=attempt_no,
-                        failed_attempt_count=attempt_no - 1,
-                        prompt_tokens=prompt_tok,
-                        completion_tokens=completion_tok,
-                        total_tokens=total_tok,
-                        retried_prompt_tokens=retried_prompt_tokens if has_retried_usage else None,
-                        retried_completion_tokens=(
-                            retried_completion_tokens if has_retried_usage else None
-                        ),
-                        estimated_cost_usd=None,
-                    )
-                    return ProviderHttpResponse(
-                        data=parsed_json,
-                        headers=resp_headers,
-                        status_code=status_code,
-                        telemetry=telemetry,
-                    )
 
                 except httpx.HTTPError as exc:
                     category = classify_transport_exception(exc)
@@ -557,7 +585,7 @@ class ProviderHttpClient:
                         attempt_no=attempt_no,
                         config=self._retry_config,
                     ):
-                        delay = compute_retry_delay_seconds(
+                        retry_delay = compute_retry_delay_seconds(
                             attempt_no=attempt_no,
                             config=self._retry_config,
                             retry_after_header=None,
@@ -570,18 +598,13 @@ class ProviderHttpClient:
                             provider=self._provider_name,
                             attempt_no=attempt_no,
                             error_type=type(exc).__name__,
-                            delay_seconds=round(delay, 3),
+                            delay_seconds=round(retry_delay, 3),
                         )
-                        if response is not None:
-                            await response.aclose()
-                            response = None
-                        await self._sleep(delay)
-                        continue
-
-                    raise map_transport_exception_to_error(
-                        provider_name=self._provider_name,
-                        exc=exc,
-                    ) from exc
+                    else:
+                        raise map_transport_exception_to_error(
+                            provider_name=self._provider_name,
+                            exc=exc,
+                        ) from exc
                 finally:
                     if not probe_accounted:
                         self._circuit_breaker.release_aborted_probe(
@@ -589,6 +612,10 @@ class ProviderHttpClient:
                         )
                     if response is not None:
                         await response.aclose()
+
+            # Concurrency permit is released before sleeping for retry backoff!
+            if retry_delay is not None:
+                await self._sleep(retry_delay)
 
         raise ProviderError(
             f"Provider '{self._provider_name}' exhausted all configured attempts.",

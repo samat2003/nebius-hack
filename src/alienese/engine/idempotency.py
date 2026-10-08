@@ -11,15 +11,22 @@ Enforces Refinement 7:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable
 
-from alienese.api.errors import IdempotencyConflict, ProtocolError
+from alienese.api.errors import IdempotencyConflict, ProtocolError, ProviderTimeout
 from alienese.api.models import ChatCompletionRequest, ChatCompletionResponse, NamedToolChoice
 from alienese.contracts.context import RequestContext
 from alienese.observability.logging import get_request_logger
+from alienese.providers.runtime.deadlines import (
+    DEFAULT_TURN_TIMEOUT_SECONDS,
+    DeadlineBudget,
+    ensure_context_deadline,
+)
 from alienese.storage.idempotency import IdempotencyRecord, IdempotencyStore
 
 _VALID_IDEMPOTENCY_KEY_RE = re.compile(r"^[\x21-\x7E]{1,255}$")
@@ -92,10 +99,26 @@ def compute_request_fingerprint(request: ChatCompletionRequest) -> str:
 
 
 class IdempotencyCoordinator:
-    """Coordinates idempotent execution of logical turn operations."""
+    """Coordinates idempotent execution of logical turn operations.
 
-    def __init__(self, store: IdempotencyStore) -> None:
+    Distinguishes:
+    1. Incoming HTTP request deadline (`ctx.deadline_monotonic` / `request_deadline_seconds`).
+    2. Duplicate waiter lock-acquisition budget (`min(remaining_request_deadline, wait_timeout)`).
+    3. Logical operation execution deadline inside `runner(ctx)`.
+    """
+
+    def __init__(
+        self,
+        store: IdempotencyStore,
+        *,
+        request_deadline_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
+        wait_timeout_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._store = store
+        self._request_deadline_seconds = request_deadline_seconds
+        self._wait_timeout_seconds = wait_timeout_seconds
+        self._clock = clock
 
     async def execute(
         self,
@@ -103,7 +126,22 @@ class IdempotencyCoordinator:
         request: ChatCompletionRequest,
         runner: Callable[[RequestContext], Awaitable[ChatCompletionResponse]],
     ) -> tuple[RequestContext, ChatCompletionResponse, bool]:
-        """Execute `runner` idempotently."""
+        """Execute `runner` idempotently while bounding duplicate waiter lock acquisition."""
+        ctx = ensure_context_deadline(
+            ctx,
+            timeout_seconds=self._request_deadline_seconds,
+            clock=self._clock,
+        )
+        incoming_deadline = DeadlineBudget.from_context(
+            ctx,
+            default_timeout_seconds=self._request_deadline_seconds,
+            clock=self._clock,
+        )
+        incoming_deadline.require_remaining(
+            provider_name="idempotency",
+            phase="pre_coordination",
+        )
+
         raw_key = ctx.idempotency_key
         if raw_key is None or not raw_key.strip():
             response = await runner(ctx)
@@ -113,7 +151,34 @@ class IdempotencyCoordinator:
         fingerprint = compute_request_fingerprint(request)
         lock = self._store.key_lock(key)
 
-        async with lock:
+        wait_budget = incoming_deadline.require_remaining(
+            provider_name="idempotency",
+            phase="lock_wait",
+        )
+        if self._wait_timeout_seconds is not None:
+            wait_budget = min(wait_budget, self._wait_timeout_seconds)
+
+        try:
+            await asyncio.wait_for(lock.__aenter__(), timeout=wait_budget)
+        except TimeoutError as exc:
+            logger = get_request_logger(ctx, "engine.idempotency")
+            logger.warning(
+                "idempotency_wait_timeout",
+                idempotency_key=key,
+                wait_budget_seconds=round(wait_budget, 3),
+            )
+            raise ProviderTimeout(
+                f"Timed out waiting ({wait_budget:.2f}s) for in-flight idempotent "
+                f"operation on key '{key}'.",
+                code="idempotency_wait_timeout",
+                status_code=504,
+            ) from exc
+
+        try:
+            incoming_deadline.require_remaining(
+                provider_name="idempotency",
+                phase="post_lock_acquire",
+            )
             existing = await self._store.get(key)
             if existing is not None:
                 if existing.request_fingerprint != fingerprint:
@@ -150,3 +215,5 @@ class IdempotencyCoordinator:
             logger = get_request_logger(ctx, "engine.idempotency")
             logger.info("idempotency_recorded", idempotency_key=key)
             return ctx, response, False
+        finally:
+            await lock.__aexit__(None, None, None)

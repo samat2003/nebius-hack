@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 from fastapi import APIRouter, Header, Request, Response
+from starlette.requests import ClientDisconnect
 
-from alienese.api.errors import ProtocolError
+from alienese.api.errors import ProtocolError, ProviderTimeout
 from alienese.api.models import ChatCompletionRequest, ChatCompletionResponse
 from alienese.config import Settings
 from alienese.contracts.context import (
@@ -19,6 +21,7 @@ from alienese.contracts.context import (
 )
 from alienese.engine.idempotency import IdempotencyCoordinator
 from alienese.engine.turn import TurnEngine
+from alienese.providers.runtime.deadlines import DeadlineBudget, ensure_context_deadline
 
 router = APIRouter()
 
@@ -48,6 +51,78 @@ def build_request_context(
     )
 
 
+async def _read_bounded_request_body(
+    request: Request,
+    *,
+    max_body_bytes: int,
+    deadline: DeadlineBudget,
+) -> bytes:
+    """Incrementally read the ASGI request stream with hard byte and deadline bounds.
+
+    Rejects oversized requests immediately as soon as the byte budget is exceeded,
+    without buffering the remainder of the stream into memory (`request.body()`).
+    """
+    content_length_header = request.headers.get("content-length")
+    if content_length_header is not None:
+        try:
+            declared_length = int(content_length_header.strip())
+        except ValueError as exc:
+            raise ProtocolError(
+                "Malformed Content-Length header; must be a non-negative integer.",
+                code="invalid_content_length",
+                status_code=400,
+            ) from exc
+        if declared_length < 0:
+            raise ProtocolError(
+                "Content-Length header cannot be negative.",
+                code="invalid_content_length",
+                status_code=400,
+            )
+        if declared_length > max_body_bytes:
+            raise ProtocolError(
+                f"Request body exceeds maximum allowed size of {max_body_bytes} bytes.",
+                code="request_body_too_large",
+                status_code=413,
+            )
+
+    remaining_budget = deadline.require_remaining(
+        provider_name="http_ingress",
+        phase="request_body_read",
+    )
+    chunks: list[bytes] = []
+    total_bytes = 0
+    try:
+        async with asyncio.timeout(remaining_budget):
+            async for chunk in request.stream():
+                deadline.require_remaining(
+                    provider_name="http_ingress",
+                    phase="request_body_read",
+                )
+                if not chunk:
+                    continue
+                total_bytes += len(chunk)
+                if total_bytes > max_body_bytes:
+                    raise ProtocolError(
+                        f"Request body exceeds maximum allowed size of {max_body_bytes} bytes.",
+                        code="request_body_too_large",
+                        status_code=413,
+                    )
+                chunks.append(chunk)
+    except ClientDisconnect as exc:
+        raise ProtocolError(
+            "Client disconnected while sending request body.",
+            code="client_disconnected",
+            status_code=400,
+        ) from exc
+    except TimeoutError as exc:
+        raise ProviderTimeout(
+            "Timed out reading HTTP request body before turn deadline.",
+            code="turn_deadline_exceeded",
+        ) from exc
+
+    return b"".join(chunks)
+
+
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(
     request: Request,
@@ -58,37 +133,33 @@ async def create_chat_completion(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> ChatCompletionResponse:
     """Execute a single OpenAI-compatible turn through the Alienese TurnEngine."""
+    settings: Settings = request.app.state.settings
+    engine: TurnEngine = request.app.state.turn_engine
+    idempotency: IdempotencyCoordinator = request.app.state.idempotency
+
     ctx = build_request_context(
         x_request_id=x_request_id,
         x_trace_id=x_trace_id,
         traceparent=traceparent,
         idempotency_key=idempotency_key,
     )
+    ctx = ensure_context_deadline(
+        ctx,
+        timeout_seconds=settings.request_deadline_seconds,
+        clock=engine.monotonic_clock,
+    )
     request.state.request_context = ctx
 
-    settings: Settings = request.app.state.settings
-    max_body_bytes = settings.max_request_body_bytes
-
-    content_length_header = request.headers.get("content-length")
-    if content_length_header is not None:
-        try:
-            declared_length = int(content_length_header)
-        except ValueError:
-            declared_length = 0
-        if declared_length > max_body_bytes:
-            raise ProtocolError(
-                f"Request body exceeds maximum allowed size of {max_body_bytes} bytes.",
-                code="request_body_too_large",
-                status_code=413,
-            )
-
-    raw_bytes = await request.body()
-    if len(raw_bytes) > max_body_bytes:
-        raise ProtocolError(
-            f"Request body exceeds maximum allowed size of {max_body_bytes} bytes.",
-            code="request_body_too_large",
-            status_code=413,
-        )
+    request_deadline = DeadlineBudget.from_context(
+        ctx,
+        default_timeout_seconds=settings.request_deadline_seconds,
+        clock=engine.monotonic_clock,
+    )
+    raw_bytes = await _read_bounded_request_body(
+        request,
+        max_body_bytes=settings.max_request_body_bytes,
+        deadline=request_deadline,
+    )
 
     try:
         raw_body: Any = json.loads(raw_bytes.decode("utf-8"))
@@ -110,9 +181,6 @@ async def create_chat_completion(
         )
 
     chat_request = ChatCompletionRequest.model_validate(raw_body)
-
-    engine: TurnEngine = request.app.state.turn_engine
-    idempotency: IdempotencyCoordinator = request.app.state.idempotency
 
     async def _run_turn(turn_ctx: RequestContext) -> ChatCompletionResponse:
         completion_response, _artifact = await engine.execute_turn(turn_ctx, chat_request)

@@ -151,14 +151,7 @@ def create_app(
         lifespan=_lifespan,
     )
 
-    app.state.settings = cfg
-    app.state.generator = eff_generator
-    app.state.controller = eff_controller
-    app.state.retriever = eff_retriever
-    app.state.trace_store = eff_trace_store
-    app.state.idempotency_store = eff_idem_store
-    app.state.idempotency = IdempotencyCoordinator(eff_idem_store)
-    app.state.turn_engine = TurnEngine(
+    turn_engine = TurnEngine(
         retriever=eff_retriever,
         controller=eff_controller,
         generator=eff_generator,
@@ -166,6 +159,19 @@ def create_app(
         tracer=eff_tracer,
         include_replay_content=cfg.alienese_trace_content,
         turn_timeout_seconds=cfg.provider_timeout_seconds,
+    )
+    app.state.settings = cfg
+    app.state.generator = eff_generator
+    app.state.controller = eff_controller
+    app.state.retriever = eff_retriever
+    app.state.trace_store = eff_trace_store
+    app.state.idempotency_store = eff_idem_store
+    app.state.turn_engine = turn_engine
+    app.state.idempotency = IdempotencyCoordinator(
+        eff_idem_store,
+        request_deadline_seconds=cfg.request_deadline_seconds,
+        wait_timeout_seconds=cfg.idempotency_wait_timeout_seconds,
+        clock=turn_engine.monotonic_clock,
     )
 
     @app.exception_handler(AlieneseError)

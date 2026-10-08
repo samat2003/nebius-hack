@@ -17,6 +17,7 @@ class ProviderCallTelemetry(BaseModel):
     latency_ms: float = Field(default=0.0, ge=0.0)
     request_attempt_id: str | None = None
     upstream_request_id: str | None = None
+    serving_fingerprint: str | None = None
     attempt_count: int = Field(default=1, ge=1)
     failed_attempt_count: int = Field(default=0, ge=0)
     prompt_tokens: int | None = Field(default=None, ge=0)
