@@ -604,3 +604,371 @@ def test_7_schema_recursion_depth_and_unsupported_keywords_rejected() -> None:
     assert ok_deep is False
     assert reason_deep is not None
     assert "recursion depth" in reason_deep
+
+
+# ---------------------------------------------------------------------------
+# 8. Merge Gate 1: Idempotency concurrency, waiter scheduling, & admission control
+# ---------------------------------------------------------------------------
+async def test_8_idempotency_concurrency_waiter_scheduling_and_admission_control() -> None:
+    """Locks with queued waiters are never evicted; capacity overflow uses admission control."""
+    import asyncio
+
+    from alienese.api.errors import ProviderUnavailable
+    from alienese.contracts.state import ExternalToolBinding
+    from alienese.engine.idempotency import IdempotencyCoordinator
+    from alienese.engine.turn import extract_deterministic_tool_arguments
+
+    _ = (extract_deterministic_tool_arguments, ExternalToolBinding)
+
+    store = InMemoryIdempotencyStore(max_entries=2, ttl_seconds=60.0)
+    coordinator = IdempotencyCoordinator(store)
+
+    engine = TurnEngine(
+        retriever=FakeRetriever(),
+        controller=FakeController(),
+        generator=FakeGenerator(),
+    )
+    req_alpha = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Alpha operation"}],
+        }
+    )
+    req_beta = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Beta operation"}],
+        }
+    )
+    req_gamma = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Gamma operation"}],
+        }
+    )
+
+    alpha_started = asyncio.Event()
+    alpha_release = asyncio.Event()
+    beta_started = asyncio.Event()
+    beta_release = asyncio.Event()
+
+    alpha_executions = 0
+    alpha_in_flight = 0
+    alpha_max_in_flight = 0
+
+    async def _alpha_runner(turn_ctx: RequestContext) -> Any:
+        nonlocal alpha_executions, alpha_in_flight, alpha_max_in_flight
+        alpha_executions += 1
+        alpha_in_flight += 1
+        alpha_max_in_flight = max(alpha_max_in_flight, alpha_in_flight)
+        alpha_started.set()
+        try:
+            await alpha_release.wait()
+            resp, _ = await engine.execute_turn(turn_ctx, req_alpha)
+            return resp
+        finally:
+            alpha_in_flight -= 1
+
+    async def _beta_runner(turn_ctx: RequestContext) -> Any:
+        beta_started.set()
+        await beta_release.wait()
+        resp, _ = await engine.execute_turn(turn_ctx, req_beta)
+        return resp
+
+    # 1. Start Holder (t1) for key "alpha"
+    t1 = asyncio.create_task(
+        coordinator.execute(
+            RequestContext(request_id="req_a1", operation_id="op_a1", idempotency_key="alpha"),
+            req_alpha,
+            _alpha_runner,
+        )
+    )
+    await alpha_started.wait()
+    alpha_lock_initial = store.key_lock("alpha")
+
+    # 2. Queue Waiter (t2) for key "alpha" and let it suspend on lock.__aenter__
+    t2 = asyncio.create_task(
+        coordinator.execute(
+            RequestContext(request_id="req_a2", operation_id="op_a2", idempotency_key="alpha"),
+            req_alpha,
+            _alpha_runner,
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # 3. Start Holder (t3) for key "beta", filling max_entries=2 active locks
+    t3 = asyncio.create_task(
+        coordinator.execute(
+            RequestContext(request_id="req_b1", operation_id="op_b1", idempotency_key="beta"),
+            req_beta,
+            _beta_runner,
+        )
+    )
+    await beta_started.wait()
+    assert store.lock_count == 2
+
+    # 4. While both "alpha" (holder + waiter) and "beta" (holder) are active,
+    #    a 3rd concurrent key "gamma" triggers bounded admission control (HTTP 503)
+    #    rather than evicting an active or waited lock.
+    with pytest.raises(ProviderUnavailable) as cap_exc:
+        await coordinator.execute(
+            RequestContext(request_id="req_g1", operation_id="op_g1", idempotency_key="gamma"),
+            req_gamma,
+            _beta_runner,
+        )
+    assert cap_exc.value.status_code == 503
+    assert cap_exc.value.code == "idempotency_capacity_exceeded"
+    assert store.key_lock("alpha") is alpha_lock_initial
+
+    # 5. Release "beta" so one slot becomes idle, then release "alpha" holder (t1)
+    #    while simultaneously scheduling another duplicate "alpha" request (t4)
+    #    and a new key "delta" (t5) during the waiter handoff window!
+    beta_release.set()
+    await t3
+
+    alpha_release.set()
+    # Immediately (before t2 wakes up on the next loop tick), request key_lock("delta")
+    # which triggers _prune_idle_locks(). "alpha" has a queued waiter (t2) so its lock
+    # MUST NOT be evicted even if _locked is momentarily False during handoff!
+    _ = store.key_lock("delta")
+    assert store.key_lock("alpha") is alpha_lock_initial
+
+    t4 = asyncio.create_task(
+        coordinator.execute(
+            RequestContext(request_id="req_a3", operation_id="op_a3", idempotency_key="alpha"),
+            req_alpha,
+            _alpha_runner,
+        )
+    )
+
+    res1, res2, res4 = await asyncio.gather(t1, t2, t4)
+    assert alpha_executions == 1
+    assert alpha_max_in_flight == 1
+    assert res1[2] is False  # first execution
+    assert res2[2] is True  # replayed to waiter t2
+    assert res4[2] is True  # replayed to t4
+    assert res1[1] == res2[1] == res4[1]
+
+
+# ---------------------------------------------------------------------------
+# 9. Merge Gate 2: Recursive fail-closed JSON Schema validation
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("bad_schema", "sample_args", "expected_fragment"),
+    [
+        (
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string", "pattern": "^[a-z]+$"}},
+            },
+            {"name": "alice"},
+            "pattern",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"email": {"type": "string", "format": "email"}},
+            },
+            {"email": "a@b.com"},
+            "format",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": True,
+                    }
+                },
+            },
+            {"tags": ["a", "b"]},
+            "uniqueItems",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"score": {"type": "number", "exclusiveMinimum": 0}},
+            },
+            {"score": 1.5},
+            "exclusiveMinimum",
+        ),
+        # Nested unsupported keyword inside an OPTIONAL property omitted from arguments={}
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "README.md"},
+                    "unused_nested": {
+                        "type": "object",
+                        "properties": {
+                            "deep": {"type": "string", "pattern": ".*"},
+                        },
+                    },
+                },
+            },
+            {"path": "README.md"},
+            "pattern",
+        ),
+        # Nested unsupported keyword inside array `items` even when array is empty `[]`
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "items_list": {
+                        "type": "array",
+                        "default": [],
+                        "items": {"type": "string", "format": "uri"},
+                    }
+                },
+            },
+            {"items_list": []},
+            "format",
+        ),
+        # Nested unsupported keyword inside `additionalProperties`
+        (
+            {
+                "type": "object",
+                "additionalProperties": {"type": "integer", "exclusiveMaximum": 100},
+            },
+            {},
+            "exclusiveMaximum",
+        ),
+        # Malformed schema structures
+        (
+            {
+                "type": "object",
+                "properties": {"bad_prop": "not_a_schema_object"},
+            },
+            {},
+            "must be a JSON object",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "string", "minLength": -1}},
+            },
+            {"x": "abc"},
+            "minLength",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "string", "minLength": 10, "maxLength": 3}},
+            },
+            {"x": "abcde"},
+            "minLength > maxLength",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "number", "minimum": 10, "maximum": 2}},
+            },
+            {"x": 5},
+            "minimum > maximum",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x", "x"],
+            },
+            {"x": "ok"},
+            "required",
+        ),
+    ],
+)
+async def test_9_json_schema_fail_closed_on_unsupported_keywords_and_malformed_schemas(
+    bad_schema: dict[str, Any],
+    sample_args: dict[str, Any],
+    expected_fragment: str,
+) -> None:
+    """Unsupported keywords and malformed schemas fail closed recursively."""
+    from alienese.contracts.state import ExternalToolBinding
+    from alienese.engine.normalize import normalize_request
+    from alienese.engine.reconstruct import reconstruct
+    from alienese.engine.turn import (
+        build_deterministic_candidates,
+        extract_deterministic_tool_arguments,
+    )
+
+    ok, reason = validate_tool_arguments_against_schema(bad_schema, sample_args)
+    assert ok is False
+    assert reason is not None
+    assert expected_fragment in reason
+
+    binding = ExternalToolBinding(
+        external_name="read_file",
+        description="Tool with unsupported or malformed schema",
+        parameters_schema=bad_schema,
+        canonical_capability=CanonicalCapability.READ_FILE,
+    )
+    extracted, is_valid = extract_deterministic_tool_arguments(binding)
+    assert extracted == {}
+    assert is_valid is False
+
+    # Ensure build_deterministic_candidates never produces an executable tool candidate
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Test malformed tool schema"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": bad_schema,
+                    },
+                }
+            ],
+        }
+    )
+    events, tools = normalize_request(req)
+    state = reconstruct(events, available_tools=tools)
+    candidates = build_deterministic_candidates(state, req)
+    tool_cands = [c for c in candidates if c.external_tool_name == "read_file"]
+    assert len(tool_cands) == 1
+    assert tool_cands[0].arguments_complete is False
+
+    # And explicit tool_choice on a tool with an unsupported/malformed schema fails closed
+    req_forced = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Force malformed tool schema"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": bad_schema,
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}},
+        }
+    )
+    with pytest.raises(CompatibilityError):
+        build_deterministic_candidates(state, req_forced)
+
+
+def test_9_json_schema_boolean_vs_integer_strict_enum_and_const() -> None:
+    """Boolean values must not match integer enum/const values (True != 1, False != 0)."""
+    int_enum_schema = {
+        "type": "object",
+        "properties": {"flag": {"enum": [0, 1]}},
+        "required": ["flag"],
+    }
+    ok_bool, _ = validate_tool_arguments_against_schema(int_enum_schema, {"flag": True})
+    assert ok_bool is False
+    ok_int, _ = validate_tool_arguments_against_schema(int_enum_schema, {"flag": 1})
+    assert ok_int is True
+
+    int_const_schema = {
+        "type": "object",
+        "properties": {"flag": {"const": 1}},
+        "required": ["flag"],
+    }
+    ok_const_bool, _ = validate_tool_arguments_against_schema(int_const_schema, {"flag": True})
+    assert ok_const_bool is False

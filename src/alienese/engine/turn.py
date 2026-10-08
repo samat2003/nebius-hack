@@ -75,22 +75,33 @@ from alienese.storage.traces import TraceStore, sanitize_replay_artifact
 
 MAX_SCHEMA_DEPTH = 16
 
-_UNSUPPORTED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
+_VALID_JSON_SCHEMA_TYPES: frozenset[str] = frozenset(
+    {"string", "boolean", "integer", "number", "array", "object", "null"}
+)
+
+# Explicit allowlist of supported JSON Schema keywords in Phase 1.
+# Any keyword outside this set (e.g., `pattern`, `format`, `uniqueItems`,
+# `exclusiveMinimum`, `$ref`, `oneOf`, `anyOf`, `allOf`, `not`, etc.)
+# causes schema validation to fail closed recursively.
+_ALLOWED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
     {
-        "$ref",
-        "$defs",
-        "definitions",
-        "oneOf",
-        "anyOf",
-        "allOf",
-        "not",
-        "patternProperties",
-        "dependencies",
-        "dependentSchemas",
-        "dependentRequired",
-        "if",
-        "then",
-        "else",
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "const",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+        "default",
+        "description",
+        "title",
+        "examples",
     }
 )
 
@@ -141,6 +152,170 @@ def _matches_json_schema_type(value: Any, expected_type: str) -> bool:
     return False
 
 
+def _json_values_equal(left: Any, right: Any) -> bool:
+    """Type-aware JSON equality (`True` != `1`, `False` != `0`)."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return float(left) == float(right)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _json_values_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        if set(left.keys()) != set(right.keys()):
+            return False
+        return all(_json_values_equal(left[k], right[k]) for k in left)
+    return type(left) is type(right) and bool(left == right)
+
+
+def _is_non_negative_int(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and val >= 0
+
+
+def _is_finite_number(val: Any) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val))
+
+
+def _validate_schema_structure(
+    schema: Any,
+    *,
+    path: str = "$",
+    depth: int = 0,
+) -> tuple[bool, str | None]:
+    """Recursively validate that a JSON Schema uses only the supported keyword subset
+    and is structurally well-formed at every node (even for optional/unpopulated fields).
+    """
+    if depth > MAX_SCHEMA_DEPTH:
+        return (
+            False,
+            f"Schema validation exceeded maximum recursion depth ({MAX_SCHEMA_DEPTH}) at '{path}'.",
+        )
+
+    if not isinstance(schema, Mapping):
+        return False, f"Schema node at '{path}' must be a JSON object."
+
+    for raw_key in schema:
+        if not isinstance(raw_key, str):
+            return False, f"Schema keyword at '{path}' must be a string."
+        if raw_key not in _ALLOWED_SCHEMA_KEYWORDS:
+            return (
+                False,
+                f"Unsupported JSON Schema keyword '{raw_key}' at '{path}'.",
+            )
+
+    if "description" in schema and not isinstance(schema["description"], str):
+        return False, f"Malformed 'description' at '{path}': must be a string."
+    if "title" in schema and not isinstance(schema["title"], str):
+        return False, f"Malformed 'title' at '{path}': must be a string."
+    if "examples" in schema and not isinstance(schema["examples"], list):
+        return False, f"Malformed 'examples' at '{path}': must be a list."
+
+    expected_type = schema.get("type")
+    if isinstance(expected_type, str):
+        if expected_type not in _VALID_JSON_SCHEMA_TYPES:
+            return False, f"Unsupported schema 'type' value '{expected_type}' at '{path}'."
+    elif isinstance(expected_type, list):
+        if not expected_type or not all(
+            isinstance(t, str) and t in _VALID_JSON_SCHEMA_TYPES for t in expected_type
+        ):
+            return False, f"Malformed union 'type' list at '{path}'."
+    elif expected_type is not None:
+        return False, f"Malformed 'type' specification at '{path}'."
+
+    if "enum" in schema:
+        enum_vals = schema["enum"]
+        if not isinstance(enum_vals, list) or len(enum_vals) == 0:
+            return False, f"Invalid or empty 'enum' definition at '{path}'."
+
+    if "minLength" in schema and not _is_non_negative_int(schema["minLength"]):
+        return False, f"Malformed 'minLength' at '{path}': must be a non-negative integer."
+    if "maxLength" in schema and not _is_non_negative_int(schema["maxLength"]):
+        return False, f"Malformed 'maxLength' at '{path}': must be a non-negative integer."
+    if (
+        "minLength" in schema
+        and "maxLength" in schema
+        and schema["minLength"] > schema["maxLength"]
+    ):
+        return False, f"Contradictory string bounds at '{path}': minLength > maxLength."
+
+    if "minimum" in schema and not _is_finite_number(schema["minimum"]):
+        return False, f"Malformed 'minimum' at '{path}': must be a finite number."
+    if "maximum" in schema and not _is_finite_number(schema["maximum"]):
+        return False, f"Malformed 'maximum' at '{path}': must be a finite number."
+    if (
+        "minimum" in schema
+        and "maximum" in schema
+        and float(schema["minimum"]) > float(schema["maximum"])
+    ):
+        return False, f"Contradictory numeric bounds at '{path}': minimum > maximum."
+
+    if "minItems" in schema and not _is_non_negative_int(schema["minItems"]):
+        return False, f"Malformed 'minItems' at '{path}': must be a non-negative integer."
+    if "maxItems" in schema and not _is_non_negative_int(schema["maxItems"]):
+        return False, f"Malformed 'maxItems' at '{path}': must be a non-negative integer."
+    if "minItems" in schema and "maxItems" in schema and schema["minItems"] > schema["maxItems"]:
+        return False, f"Contradictory array bounds at '{path}': minItems > maxItems."
+
+    if "items" in schema:
+        items_schema = schema["items"]
+        if not isinstance(items_schema, Mapping):
+            return False, f"Malformed 'items' schema at '{path}': must be a schema object."
+        ok, reason = _validate_schema_structure(
+            items_schema,
+            path=f"{path}.items",
+            depth=depth + 1,
+        )
+        if not ok:
+            return False, reason
+
+    if "required" in schema:
+        req = schema["required"]
+        if (
+            not isinstance(req, list)
+            or not all(isinstance(k, str) and bool(k) for k in req)
+            or len(set(req)) != len(req)
+        ):
+            return (
+                False,
+                f"Malformed 'required' at '{path}': must be a list of unique non-empty strings.",
+            )
+
+    if "properties" in schema:
+        props = schema["properties"]
+        if not isinstance(props, Mapping):
+            return False, f"Malformed 'properties' at '{path}': must be an object."
+        for prop_name, prop_schema in props.items():
+            if not isinstance(prop_name, str) or not prop_name:
+                return False, f"Malformed property name in 'properties' at '{path}'."
+            child_path = f"{path}.{prop_name}" if path != "$" else prop_name
+            ok, reason = _validate_schema_structure(
+                prop_schema,
+                path=child_path,
+                depth=depth + 1,
+            )
+            if not ok:
+                return False, reason
+
+    if "additionalProperties" in schema:
+        add_props = schema["additionalProperties"]
+        if isinstance(add_props, Mapping):
+            ok, reason = _validate_schema_structure(
+                add_props,
+                path=f"{path}.additionalProperties",
+                depth=depth + 1,
+            )
+            if not ok:
+                return False, reason
+        elif not isinstance(add_props, bool):
+            return (
+                False,
+                f"Malformed 'additionalProperties' at '{path}': must be bool or schema object.",
+            )
+
+    return True, None
+
+
 def _validate_schema_node(
     schema: Mapping[str, Any],
     value: Any,
@@ -154,37 +329,26 @@ def _validate_schema_node(
             f"Schema validation exceeded maximum recursion depth ({MAX_SCHEMA_DEPTH}) at '{path}'.",
         )
 
-    for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
-        if kw in schema:
-            return (
-                False,
-                f"Unsupported JSON Schema keyword '{kw}' at '{path}'.",
-            )
-
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _json_values_equal(value, schema["const"]):
         return False, f"Argument '{path}' did not match required const value."
 
     expected_type = schema.get("type")
     if isinstance(expected_type, str):
         if not _matches_json_schema_type(value, expected_type):
             return False, f"Argument '{path}' failed type check: expected {expected_type}."
-    elif isinstance(expected_type, list):
-        if not any(
-            isinstance(t, str) and _matches_json_schema_type(value, t) for t in expected_type
-        ):
-            return (
-                False,
-                f"Argument '{path}' failed union type check: expected one of {expected_type}.",
-            )
-    elif expected_type is not None:
-        return False, f"Unsupported schema 'type' specification at '{path}'."
+    elif isinstance(expected_type, list) and not any(
+        isinstance(t, str) and _matches_json_schema_type(value, t) for t in expected_type
+    ):
+        return (
+            False,
+            f"Argument '{path}' failed union type check: expected one of {expected_type}.",
+        )
 
     enum_values = schema.get("enum")
-    if enum_values is not None:
-        if not isinstance(enum_values, list) or len(enum_values) == 0:
-            return False, f"Invalid or empty 'enum' definition at '{path}'."
-        if value not in enum_values:
-            return False, f"Argument '{path}' value is not in allowed enum {enum_values}."
+    if isinstance(enum_values, list) and not any(
+        _json_values_equal(value, candidate) for candidate in enum_values
+    ):
+        return False, f"Argument '{path}' value is not in allowed enum {enum_values}."
 
     if isinstance(value, str):
         min_len = schema.get("minLength")
@@ -195,11 +359,13 @@ def _validate_schema_node(
             return False, f"Argument '{path}' exceeds maxLength={max_len}."
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            return False, f"Argument '{path}' must be a finite number."
         minimum = schema.get("minimum")
-        if isinstance(minimum, (int, float)) and value < minimum:
+        if isinstance(minimum, (int, float)) and float(value) < float(minimum):
             return False, f"Argument '{path}' is less than minimum={minimum}."
         maximum = schema.get("maximum")
-        if isinstance(maximum, (int, float)) and value > maximum:
+        if isinstance(maximum, (int, float)) and float(value) > float(maximum):
             return False, f"Argument '{path}' exceeds maximum={maximum}."
 
     if isinstance(value, (list, tuple)):
@@ -220,33 +386,14 @@ def _validate_schema_node(
                 )
                 if not ok:
                     return False, reason
-        elif items_schema is not None:
-            return False, f"Unsupported 'items' schema definition at '{path}'."
 
     if isinstance(value, Mapping):
         required_fields = schema.get("required", [])
-        if not isinstance(required_fields, list) or not all(
-            isinstance(k, str) for k in required_fields
-        ):
-            return False, f"Schema 'required' field at '{path}' must be a list of strings."
         for req_key in required_fields:
             if req_key not in value:
                 return False, f"Missing required tool argument '{req_key}'."
 
         properties = schema.get("properties", {})
-        if not isinstance(properties, Mapping):
-            return False, f"Schema 'properties' field at '{path}' must be an object."
-
-        for prop_key, prop_spec in properties.items():
-            if not isinstance(prop_spec, Mapping):
-                return False, f"Property schema '{prop_key}' at '{path}' must be an object."
-            for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
-                if kw in prop_spec:
-                    return (
-                        False,
-                        f"Unsupported JSON Schema keyword '{kw}' at '{path}.{prop_key}'.",
-                    )
-
         additional_props = schema.get("additionalProperties", True)
         if additional_props is False:
             for arg_key in value:
@@ -267,8 +414,6 @@ def _validate_schema_node(
                     )
                     if not ok:
                         return False, reason
-        elif additional_props is not True:
-            return False, f"Unsupported 'additionalProperties' definition at '{path}'."
 
         for arg_key, arg_val in value.items():
             prop_schema = properties.get(arg_key)
@@ -290,13 +435,22 @@ def validate_tool_arguments_against_schema(
     parameters_schema: Mapping[str, Any],
     arguments: Mapping[str, Any],
 ) -> tuple[bool, str | None]:
-    """Validate candidate tool arguments against the supported JSON Schema subset."""
-    if not parameters_schema:
-        return True, None
+    """Validate candidate tool arguments against the explicit supported JSON Schema subset.
 
-    for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
-        if kw in parameters_schema:
-            return False, f"Unsupported JSON Schema keyword '{kw}' at '$'."
+    Fails closed (`False`) if `parameters_schema` is malformed, exceeds
+    `MAX_SCHEMA_DEPTH`, or contains any unsupported JSON Schema keyword at any
+    nesting level.
+    """
+    if not isinstance(parameters_schema, Mapping) or not isinstance(arguments, Mapping):
+        return False, "Tool parameters_schema and arguments must be JSON objects."
+
+    struct_ok, struct_reason = _validate_schema_structure(
+        parameters_schema,
+        path="$",
+        depth=0,
+    )
+    if not struct_ok:
+        return False, struct_reason
 
     schema_type = parameters_schema.get("type", "object")
     if schema_type != "object":
@@ -308,14 +462,22 @@ def validate_tool_arguments_against_schema(
 def extract_deterministic_tool_arguments(
     binding: ExternalToolBinding,
 ) -> tuple[dict[str, Any], bool]:
-    """Extract only safe schema-defined defaults without fabricating required values."""
-    schema = binding.parameters_schema
-    if not schema:
-        return {}, True
+    """Extract only safe schema-defined defaults without fabricating required values.
 
-    for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
-        if kw in schema:
-            return {}, False
+    Fails closed (`{}, False`) if the tool's `parameters_schema` is malformed,
+    uses unsupported JSON Schema keywords anywhere in its tree, or defines an
+    invalid default value.
+    """
+    schema = binding.parameters_schema
+    if not isinstance(schema, Mapping):
+        return {}, False
+
+    struct_ok, _ = _validate_schema_structure(schema, path="$", depth=0)
+    if not struct_ok:
+        return {}, False
+
+    if schema.get("type", "object") != "object":
+        return {}, False
 
     properties = schema.get("properties", {})
     extracted: dict[str, Any] = {}
@@ -329,8 +491,9 @@ def extract_deterministic_tool_arguments(
                     path=str(prop_name),
                     depth=1,
                 )
-                if ok:
-                    extracted[str(prop_name)] = default_val
+                if not ok:
+                    return {}, False
+                extracted[str(prop_name)] = default_val
 
     valid, _reason = validate_tool_arguments_against_schema(schema, extracted)
     return extracted, valid

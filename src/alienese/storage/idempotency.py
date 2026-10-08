@@ -4,8 +4,18 @@ Separates:
 - `request_id`: per-HTTP-attempt correlation ID
 - `operation_id`: stable logical operation ID mapped to the idempotency record
 
-Enforces bounded memory growth via configurable TTL expiration and LRU eviction,
-including pruning idle per-key locks.
+Concurrency & retention guarantees:
+- Per-key mutual exclusion uses reference-counted locks (`_ManagedKeyLock`) that
+  track both the active lock holder and all queued waiting coroutines. A lock is
+  never evicted or replaced while any coroutine holds it or is waiting to
+  acquire it—including the event-loop scheduling window between `release()` and
+  a queued waiter waking up.
+- When `max_entries` lock slots are simultaneously held/awaited by active
+  in-flight operations, bounded admission control rejects additional concurrent
+  keys with `ProviderUnavailable` (`code="idempotency_capacity_exceeded"`,
+  HTTP 503) rather than breaking per-key mutual exclusion.
+- In-memory idempotency guarantees are scoped to a single process lifetime and
+  bounded by configured `max_entries` (LRU eviction) and `ttl_seconds`.
 """
 
 from __future__ import annotations
@@ -14,10 +24,12 @@ import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from types import TracebackType
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from alienese.api.errors import ProviderUnavailable
 from alienese.api.models import ChatCompletionResponse
 
 
@@ -50,8 +62,54 @@ class IdempotencyStore(Protocol):
         ...
 
 
+class _ManagedKeyLock(asyncio.Lock):
+    """An `asyncio.Lock` that tracks active holders and queued waiters explicitly.
+
+    In Python `asyncio`, `Lock.release()` marks `_locked = False` and schedules
+    the next waiter via `call_soon()` before that waiter coroutine resumes.
+    Tracking `active_refs` synchronously around `__aenter__` / `__aexit__`
+    ensures the store never treats a lock with queued waiters as idle.
+    """
+
+    def __init__(self, key: str, store: InMemoryIdempotencyStore) -> None:
+        super().__init__()
+        self.key = key
+        self._store = store
+        self.active_refs: int = 0
+
+    @property
+    def is_in_use(self) -> bool:
+        """Return True if held or if any coroutine is queued waiting to acquire."""
+        return self.active_refs > 0 or self.locked()
+
+    async def __aenter__(self) -> None:
+        self.active_refs += 1
+        try:
+            await super().__aenter__()
+        except BaseException:
+            self.active_refs -= 1
+            self._store._on_lock_released(self.key)
+            raise
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        try:
+            await super().__aexit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.active_refs -= 1
+            self._store._on_lock_released(self.key)
+
+
 class InMemoryIdempotencyStore:
-    """Bounded in-memory IdempotencyStore supporting concurrent duplicate coordination."""
+    """Bounded in-memory IdempotencyStore supporting concurrent duplicate coordination.
+
+    Note: Retention is bounded by `max_entries`, `ttl_seconds`, and the current
+    OS process lifetime.
+    """
 
     def __init__(
         self,
@@ -68,7 +126,15 @@ class InMemoryIdempotencyStore:
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._records: OrderedDict[str, tuple[float, IdempotencyRecord]] = OrderedDict()
-        self._locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+        self._locks: OrderedDict[str, _ManagedKeyLock] = OrderedDict()
+
+    def _on_lock_released(self, key: str) -> None:
+        """Clean up an unreferenced lock if its key has no stored record and we are at capacity."""
+        lock = self._locks.get(key)
+        if lock is None or lock.is_in_use:
+            return
+        if key not in self._records and len(self._locks) > self._max_entries:
+            self._locks.pop(key, None)
 
     def _prune_expired(self, now: float) -> None:
         expired_keys = [
@@ -79,26 +145,27 @@ class InMemoryIdempotencyStore:
         for key in expired_keys:
             self._records.pop(key, None)
             lock = self._locks.get(key)
-            if lock is not None and not lock.locked():
+            if lock is not None and not lock.is_in_use:
                 self._locks.pop(key, None)
 
     def _prune_idle_locks(self) -> None:
         if len(self._locks) < self._max_entries:
             return
-        idle_keys = [
-            k for k, lk in self._locks.items() if not lk.locked() and k not in self._records
+        # 1. Evict strictly idle locks (no holder, no queued waiters) that have no cached record
+        idle_without_record = [
+            k for k, lk in self._locks.items() if not lk.is_in_use and k not in self._records
         ]
-        for k in idle_keys:
+        for k in idle_without_record:
             self._locks.pop(k, None)
-        while len(self._locks) >= self._max_entries:
-            evicted = False
-            for k, lk in list(self._locks.items()):
-                if not lk.locked():
-                    self._locks.pop(k, None)
-                    evicted = True
-                    break
-            if not evicted:
-                break
+            if len(self._locks) < self._max_entries:
+                return
+
+        # 2. If still at capacity, evict oldest strictly idle locks (never evicting in-use locks)
+        for k, lk in list(self._locks.items()):
+            if not lk.is_in_use:
+                self._locks.pop(k, None)
+                if len(self._locks) < self._max_entries:
+                    return
 
     async def get(self, key: str) -> IdempotencyRecord | None:
         """Return the stored IdempotencyRecord for key if present and not expired."""
@@ -121,19 +188,33 @@ class InMemoryIdempotencyStore:
             while len(self._records) >= self._max_entries:
                 evicted_key, _ = self._records.popitem(last=False)
                 lk = self._locks.get(evicted_key)
-                if lk is not None and not lk.locked():
+                if lk is not None and not lk.is_in_use:
                     self._locks.pop(evicted_key, None)
         self._records[key] = (now, record)
 
     def key_lock(self, key: str) -> asyncio.Lock:
-        """Return or create an asyncio.Lock for the specified idempotency key."""
+        """Return or create a reference-counted lock for the specified idempotency key.
+
+        Never evicts or replaces a lock that is currently held or has queued
+        waiters. Raises `ProviderUnavailable` (HTTP 503) if all `max_entries`
+        lock slots are simultaneously in use by active operations.
+        """
         self._prune_expired(self._clock())
-        lock = self._locks.get(key)
-        if lock is not None:
+        existing = self._locks.get(key)
+        if existing is not None:
             self._locks.move_to_end(key)
-            return lock
+            return existing
+
         self._prune_idle_locks()
-        lock = asyncio.Lock()
+        if len(self._locks) >= self._max_entries:
+            raise ProviderUnavailable(
+                "Idempotency store concurrency capacity exhausted; all lock slots have "
+                "active in-flight operations or queued waiters.",
+                param="Idempotency-Key",
+                code="idempotency_capacity_exceeded",
+            )
+
+        lock = _ManagedKeyLock(key, self)
         self._locks[key] = lock
         return lock
 

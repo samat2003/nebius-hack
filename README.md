@@ -121,7 +121,7 @@ uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 ### Idempotency and correlation headers
 
-- `Idempotency-Key`: Maps a canonical request fingerprint to a stable logical `operation_id` and completed response. Retried HTTP requests with the same key and identical body receive a fresh per-attempt `X-Request-ID` in logs and headers while returning the exact previously completed logical response (`X-Idempotent-Replay: true` and original `X-Operation-ID`). Reusing a key with a different request payload fails with HTTP 409 (`idempotency_conflict`).
+- `Idempotency-Key`: Maps a canonical request fingerprint to a stable logical `operation_id` and completed response. Retried HTTP requests with the same key and identical body receive a fresh per-attempt `X-Request-ID` in logs and headers while returning the exact previously completed logical response (`X-Idempotent-Replay: true` and original `X-Operation-ID`). Reusing a key with a different request payload fails with HTTP 409 (`idempotency_conflict`). In Phase 1, idempotency state is stored in memory (`InMemoryIdempotencyStore`); guarantees are bounded by the configured entry capacity (`ALIENESE_IDEMPOTENCY_MAX_ENTRIES`), TTL (`ALIENESE_IDEMPOTENCY_TTL_SECONDS`), and single-process lifetime.
 - `X-Request-ID`: Per-HTTP-attempt correlation identifier (preserved if valid or generated).
 - `X-Trace-ID`: Application-level correlation identifier (kept distinct from OpenTelemetry internal trace IDs).
 - `traceparent`: Optional W3C Trace Context header used for OpenTelemetry distributed span propagation.
