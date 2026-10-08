@@ -9,6 +9,7 @@ from fastapi import APIRouter, Header, Request, Response
 
 from alienese.api.errors import ProtocolError
 from alienese.api.models import ChatCompletionRequest, ChatCompletionResponse
+from alienese.config import Settings
 from alienese.contracts.context import (
     RequestContext,
     generate_correlation_trace_id,
@@ -65,17 +66,41 @@ async def create_chat_completion(
     )
     request.state.request_context = ctx
 
-    try:
-        raw_body: Any = await request.json()
-    except json.JSONDecodeError as exc:
+    settings: Settings = request.app.state.settings
+    max_body_bytes = settings.max_request_body_bytes
+
+    content_length_header = request.headers.get("content-length")
+    if content_length_header is not None:
+        try:
+            declared_length = int(content_length_header)
+        except ValueError:
+            declared_length = 0
+        if declared_length > max_body_bytes:
+            raise ProtocolError(
+                f"Request body exceeds maximum allowed size of {max_body_bytes} bytes.",
+                code="request_body_too_large",
+                status_code=413,
+            )
+
+    raw_bytes = await request.body()
+    if len(raw_bytes) > max_body_bytes:
         raise ProtocolError(
-            f"Malformed JSON request body: {exc.msg}",
-            code="invalid_json",
-        ) from exc
+            f"Request body exceeds maximum allowed size of {max_body_bytes} bytes.",
+            code="request_body_too_large",
+            status_code=413,
+        )
+
+    try:
+        raw_body: Any = json.loads(raw_bytes.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise ProtocolError(
             "Request body must be valid UTF-8 encoded JSON.",
             code="invalid_encoding",
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ProtocolError(
+            f"Malformed JSON request body: {exc.msg}",
+            code="invalid_json",
         ) from exc
 
     if not isinstance(raw_body, dict):

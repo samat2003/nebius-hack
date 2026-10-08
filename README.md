@@ -99,14 +99,14 @@ uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ### Endpoints
 
 - `GET /health` — runtime liveness, version, and provider mode (`fake`).
-- `GET /v1/models` — available logical model identifiers.
+- `GET /v1/models` — exposes `alienese-default` as the single supported public model in Phase 1.
 - `POST /v1/chat/completions` — single-turn non-streaming completion returning either one assistant text response or one validated tool call.
 
 ### `POST /v1/chat/completions` compatibility contract
 
 | Parameter | Status | Behavior |
 | --- | --- | --- |
-| `model` | Supported | Validated non-empty string; echoed in response |
+| `model` | Supported | Must be `alienese-default` in Phase 1; unknown model IDs rejected with `compatibility_error` (`model_not_supported`) |
 | `messages` | Supported | `system`, `developer`, `user`, `assistant`, and `tool` roles normalized into typed events |
 | `tools` | Supported | Function tool schemas bound to `ExternalToolBinding`; unknown tools preserved as `CUSTOM_TOOL` |
 | `tool_choice` | Supported | `"auto"`, `"none"`, `"required"`, or named function object (`{"type": "function", "function": {"name": "..."}}`). Never fabricates missing required tool arguments |

@@ -234,9 +234,9 @@ def test_settings_safe_dump_masks_secret_keys() -> None:
     ctrl_secret = "sk-" + "controller-secret-key-123456"
     gen_secret = "nvapi-" + "generator-secret-key-123456"
     settings = Settings(
-        RETRIEVER_API_KEY=SecretStr(ret_secret),
-        CONTROLLER_API_KEY=SecretStr(ctrl_secret),
-        GENERATOR_API_KEY=SecretStr(gen_secret),
+        retriever_api_key=SecretStr(ret_secret),
+        controller_api_key=SecretStr(ctrl_secret),
+        generator_api_key=SecretStr(gen_secret),
     )
     dumped = settings.safe_dump()
     assert dumped["retriever_api_key"] == REDACTED_PLACEHOLDER

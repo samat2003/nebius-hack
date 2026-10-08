@@ -43,7 +43,7 @@ async def test_health_and_models_endpoints() -> None:
         body = models_resp.json()
         assert body["object"] == "list"
         model_ids = [m["id"] for m in body["data"]]
-        assert "alienese-default" in model_ids
+        assert model_ids == ["alienese-default"]
 
 
 async def test_chat_completions_fake_assistant_response() -> None:
@@ -87,28 +87,41 @@ async def test_chat_completions_fake_assistant_response() -> None:
 async def test_chat_completions_fake_tool_call_when_arguments_complete() -> None:
     app = create_app()
     transport = httpx.ASGITransport(app=app)
+    tool_def = {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "default": "."},
+                },
+                "required": ["directory"],
+            },
+        },
+    }
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # In 'auto' mode, FakeController conservatively responds rather than auto-calling
+        auto_resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "alienese-default",
+                "messages": [{"role": "user", "content": "List repository files"}],
+                "tools": [tool_def],
+            },
+        )
+        assert auto_resp.status_code == 200
+        assert auto_resp.json()["choices"][0]["finish_reason"] == "stop"
+
+        # When explicitly requested via tool_choice, low-risk tool with defaults is selected
         resp = await client.post(
             "/v1/chat/completions",
             json={
                 "model": "alienese-default",
                 "messages": [{"role": "user", "content": "List repository files"}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "list_files",
-                            "description": "List files in directory",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "directory": {"type": "string", "default": "."},
-                                },
-                                "required": ["directory"],
-                            },
-                        },
-                    }
-                ],
+                "tools": [tool_def],
+                "tool_choice": {"type": "function", "function": {"name": "list_files"}},
             },
         )
         assert resp.status_code == 200
@@ -327,8 +340,8 @@ async def test_retriever_provider_timeout_fault_mode() -> None:
                 ],
             },
         )
-        assert resp.status_code == 504
-        assert resp.json()["error"]["type"] == "provider_timeout"
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["finish_reason"] == "stop"
 
 
 async def test_tracing_exporter_failure_does_not_fail_inference() -> None:

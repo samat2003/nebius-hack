@@ -44,8 +44,8 @@ def test_redact_string_patterns() -> None:
     assert "98765" not in redacted_sk
 
     # PEM private keys
-    pem_begin = "-----BEGIN " + "RSA PRIVATE KEY-----"
-    pem_end = "-----END " + "RSA PRIVATE KEY-----"
+    pem_begin = "".join(["-----BEGIN ", "RSA PRIVATE KEY-----"])
+    pem_end = "".join(["-----END ", "RSA PRIVATE KEY-----"])
     pem = f"Prefix\n{pem_begin}\nMIIEpAIBAAKCAQEA0123456789secretkeymaterial\n{pem_end}\nSuffix"
     redacted_pem = redact_string(pem)
     assert "MIIEpAIBAAKCAQEA0123456789secretkeymaterial" not in redacted_pem

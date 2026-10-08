@@ -1,7 +1,15 @@
-"""Deterministic fake implementations of Retriever, Controller, and Generator.
+"""Deterministic fake providers for Retriever, Controller, and Generator.
 
-Operates completely offline without API keys, network access, or GPUs, and supports
-controlled fault injection for resilience and invariant testing.
+Operates completely offline with zero external API keys, network calls, or GPUs.
+Supports deterministic fault injection (`TIMEOUT`, `UNAVAILABLE`, `MALFORMED_RESPONSE`).
+
+Safety & protocol invariants:
+- `FakeController` uses a conservative default selection policy: in `auto` mode
+  it prefers `GENERATION_JOB` / `ASSISTANT_RESPONSE` (`cand_answer`) rather than
+  automatically executing external commands, file edits, or custom tools merely
+  because their JSON Schemas contain defaults.
+- `FakeGenerator` emits deterministic synthetic output without echoing raw user
+  prompts or tool outputs.
 """
 
 from __future__ import annotations
@@ -9,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from alienese.api.errors import InvalidProviderResponse
-from alienese.contracts.candidates import CandidateAction, CandidateDisposition
+from alienese.contracts.candidates import CandidateAction, CandidateDisposition, RiskClass
 from alienese.contracts.context import RequestContext
 from alienese.contracts.decisions import (
     CandidateScore,
@@ -30,7 +38,6 @@ from alienese.contracts.providers import (
     RetrievalSemantics,
 )
 from alienese.contracts.state import WorkingState
-from alienese.observability.redaction import redact_string
 from alienese.providers.base import ProviderFaultMode, raise_for_fault_mode
 
 
@@ -170,22 +177,18 @@ class FakeController:
         state: WorkingState,
         candidates: Sequence[CandidateAction],
     ) -> str:
-        """Select the highest-priority executable candidate deterministically."""
-        # If the latest event was a tool observation, prefer synthesizing an answer
-        # rather than repeating the same external tool call in an infinite loop.
-        has_fresh_tool_observation = (
-            state.latest_tool_observation is not None
-            and state.last_sequence_no == state.latest_tool_observation.sequence_no
-        )
+        """Select the safest executable candidate deterministically.
 
-        if not has_fresh_tool_observation:
-            for cand in candidates:
-                if (
-                    cand.disposition == CandidateDisposition.EXTERNAL_TOOL
-                    and cand.arguments_complete
-                ):
-                    return cand.candidate_id
-
+        Conservative fake-controller policy:
+        1. Prefer generating a bounded assistant response (`GENERATION_JOB` or
+           `ASSISTANT_RESPONSE`) whenever present in `candidates` (e.g., `auto` mode),
+           never automatically triggering shell commands, file mutations, or
+           custom tools merely because their JSON Schema contains valid defaults.
+        2. When the caller explicitly constrained the turn to tool candidates
+           (`tool_choice='required'` or `NamedToolChoice`), prefer low-risk
+           executable tools (`RiskClass.LOW`) with complete arguments.
+        """
+        _ = state
         for cand in candidates:
             if cand.disposition in (
                 CandidateDisposition.GENERATION_JOB,
@@ -193,11 +196,23 @@ class FakeController:
             ):
                 return cand.candidate_id
 
+        for cand in candidates:
+            if (
+                cand.disposition == CandidateDisposition.EXTERNAL_TOOL
+                and cand.arguments_complete
+                and cand.risk_class == RiskClass.LOW
+            ):
+                return cand.candidate_id
+
+        for cand in candidates:
+            if cand.disposition == CandidateDisposition.EXTERNAL_TOOL and cand.arguments_complete:
+                return cand.candidate_id
+
         return candidates[0].candidate_id
 
 
 class FakeGenerator:
-    """Deterministic offline implementation of the Generator protocol."""
+    """Deterministic, non-reflective offline implementation of the Generator protocol."""
 
     def __init__(
         self,
@@ -205,31 +220,31 @@ class FakeGenerator:
         model_id: str = "nvidia/nemotron",
         model_revision: str = "fake-v1",
         fault_mode: ProviderFaultMode = ProviderFaultMode.NONE,
+        static_response: str | None = None,
     ) -> None:
         self.provider_name = "fake_generator"
         self.model_id = model_id
         self.model_revision = model_revision
         self.fault_mode = fault_mode
+        self.static_response = static_response
 
     async def generate(
         self,
         ctx: RequestContext,
         job: GenerationJob,
     ) -> GenerationResult:
-        """Deterministically synthesize a response for a typed GenerationJob."""
+        """Deterministically synthesize a non-reflective response for a typed GenerationJob."""
         raise_for_fault_mode(self.provider_name, self.fault_mode)
 
-        prompt_summary = redact_string(
-            (job.latest_user_request or job.initial_user_request or "").strip()
-        )
-        if not prompt_summary:
-            prompt_summary = "no user prompt"
+        if self.static_response is not None:
+            content = self.static_response
+        else:
+            content = f"[fake:{job.job_type.value.lower()}] Synthetic response for {job.job_id}"
+            if job.selected_evidence:
+                content += f" (with {len(job.selected_evidence)} evidence item(s))"
 
-        content = f"[fake:{job.job_type.value.lower()}] Processed request: {prompt_summary}"
-        if job.selected_evidence:
-            content += f" (with {len(job.selected_evidence)} evidence item(s))"
-
-        prompt_tokens = max(1, len(prompt_summary.split()))
+        prompt_source = (job.latest_user_request or job.initial_user_request or "").strip()
+        prompt_tokens = max(1, len(prompt_source.split())) if prompt_source else 1
         completion_tokens = max(1, len(content.split()))
 
         return GenerationResult(

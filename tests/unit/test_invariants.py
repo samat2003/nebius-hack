@@ -39,7 +39,6 @@ from alienese.contracts.state import CanonicalCapability, ExternalToolBinding
 from alienese.engine.normalize import normalize_request, normalize_tools
 from alienese.engine.reconstruct import reconstruct
 from alienese.engine.turn import TurnEngine, enforce_executable_candidate_invariant
-from alienese.observability.redaction import REDACTED_PLACEHOLDER
 from alienese.providers.fake import FakeController, FakeGenerator, FakeRetriever
 from alienese.storage.traces import InMemoryTraceStore, dump_replay_artifact_json
 
@@ -294,7 +293,7 @@ def test_9_unknown_tool_is_never_classified_as_run_command() -> None:
     bindings = normalize_tools(req.tools)
     assert len(bindings) == 1
     assert bindings[0].canonical_capability == CanonicalCapability.CUSTOM_TOOL
-    assert bindings[0].canonical_capability != CanonicalCapability.RUN_COMMAND
+    assert bindings[0].canonical_capability.value != "RUN_COMMAND"
 
 
 async def test_10_replay_artifact_redacts_secret_material_before_persistence() -> None:
@@ -327,5 +326,6 @@ async def test_10_replay_artifact_redacts_secret_material_before_persistence() -
 
     assert "supersecretpayload" not in serialized_json
     assert secret_sk not in serialized_json
-    assert REDACTED_PLACEHOLDER in serialized_json
+    assert stored.replayable is False
+    assert stored.trace_mode.value == "metadata_only"
     assert "supersecretpayload" not in str(artifact.model_dump(mode="json"))

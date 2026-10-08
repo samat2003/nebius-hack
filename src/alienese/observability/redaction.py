@@ -125,3 +125,8 @@ def redact_mapping(data: Mapping[str, Any]) -> dict[str, Any]:
         else:
             redacted[key_str] = redact_value(raw_val)
     return redacted
+
+
+def contains_sensitive_material(value: Any) -> bool:
+    """Return True if `value` contains any secret key or string pattern that would be redacted."""
+    return bool(redact_value(value) != value)

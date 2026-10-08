@@ -15,8 +15,8 @@ from pydantic import ValidationError
 
 from alienese import __version__
 from alienese.api.chat_completions import build_request_context, router
-from alienese.api.errors import AlieneseError, ProtocolError
-from alienese.api.models import HealthResponse, ModelInfo, ModelListResponse
+from alienese.api.errors import AlieneseError, CompatibilityError, ProtocolError
+from alienese.api.models import PUBLIC_MODEL_ID, HealthResponse, ModelInfo, ModelListResponse
 from alienese.config import Settings
 from alienese.contracts.context import RequestContext
 from alienese.contracts.providers import Controller, Generator, Retriever
@@ -58,8 +58,19 @@ def create_app(
     eff_retriever = retriever or FakeRetriever(model_id=cfg.retriever_model)
     eff_controller = controller or FakeController(model_id=cfg.controller_model)
     eff_generator = generator or FakeGenerator(model_id=cfg.generator_model)
-    eff_idem_store = idempotency_store or InMemoryIdempotencyStore()
-    eff_trace_store = trace_store if trace_store is not None else InMemoryTraceStore()
+    eff_idem_store = idempotency_store or InMemoryIdempotencyStore(
+        max_entries=cfg.idempotency_max_entries,
+        ttl_seconds=cfg.idempotency_ttl_seconds,
+    )
+    eff_trace_store = (
+        trace_store
+        if trace_store is not None
+        else InMemoryTraceStore(
+            allow_full_fidelity=cfg.alienese_trace_content,
+            max_entries=cfg.trace_store_max_entries,
+            ttl_seconds=cfg.trace_store_ttl_seconds,
+        )
+    )
     eff_tracer = tracer or RuntimeTracer()
 
     app = FastAPI(
@@ -79,6 +90,7 @@ def create_app(
         generator=eff_generator,
         trace_store=eff_trace_store,
         tracer=eff_tracer,
+        include_replay_content=cfg.alienese_trace_content,
     )
 
     @app.exception_handler(AlieneseError)
@@ -113,6 +125,24 @@ def create_app(
     ) -> JSONResponse:
         ctx = _extract_request_context(request)
         errs = exc.errors()
+        for err in errs:
+            err_ctx = err.get("ctx")
+            if isinstance(err_ctx, dict) and isinstance(err_ctx.get("error"), CompatibilityError):
+                comp_err: CompatibilityError = err_ctx["error"]
+                envelope = comp_err.to_envelope(
+                    request_id=ctx.request_id,
+                    operation_id=ctx.operation_id,
+                    correlation_trace_id=ctx.correlation_trace_id,
+                )
+                return JSONResponse(
+                    status_code=comp_err.status_code,
+                    content=envelope.model_dump(mode="json"),
+                    headers={
+                        "X-Request-ID": ctx.request_id,
+                        "X-Operation-ID": ctx.operation_id,
+                        "X-Trace-ID": ctx.correlation_trace_id,
+                    },
+                )
         if errs:
             first_err = errs[0]
             loc = ".".join(str(part) for part in first_err.get("loc", ())) or None
@@ -178,9 +208,7 @@ def create_app(
     async def list_models() -> ModelListResponse:
         return ModelListResponse(
             data=[
-                ModelInfo(id="alienese-default"),
-                ModelInfo(id=cfg.controller_model),
-                ModelInfo(id=cfg.generator_model),
+                ModelInfo(id=PUBLIC_MODEL_ID),
             ]
         )
 

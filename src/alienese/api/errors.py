@@ -45,6 +45,7 @@ class AlieneseError(Exception):
         *,
         param: str | None = None,
         code: str | None = None,
+        status_code: int | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
@@ -52,6 +53,8 @@ class AlieneseError(Exception):
         self.param = param
         if code is not None:
             self.code = code
+        if status_code is not None:
+            self.status_code = status_code
         self.details = details or {}
 
     def to_envelope(

@@ -19,6 +19,29 @@
         }
       }
     ],
+    "candidate_count": 2,
+    "candidate_digests": [
+      {
+        "arguments_complete": true,
+        "candidate_id": "cand_tool_list_files",
+        "canonical_intent": "LIST_FILES",
+        "disposition": "EXTERNAL_TOOL",
+        "external_tool_name": "list_files",
+        "generation_job_type": null,
+        "requires_generation": false,
+        "risk_class": "LOW"
+      },
+      {
+        "arguments_complete": true,
+        "candidate_id": "cand_answer",
+        "canonical_intent": "RESPOND",
+        "disposition": "GENERATION_JOB",
+        "external_tool_name": null,
+        "generation_job_type": "ANSWER",
+        "requires_generation": true,
+        "risk_class": "LOW"
+      }
+    ],
     "candidates": [
       {
         "arguments": {
@@ -73,6 +96,58 @@
       ],
       "selected_candidate_id": "cand_answer"
     },
+    "event_count": 4,
+    "event_digests": [
+      {
+        "arguments_sha256": null,
+        "content_length": 56,
+        "content_sha256": "19430f2d2ad7bbd18a851dda57146f5597701cd9557238c38225771b7930ff3a",
+        "event_id": "evt_0000_444485ce01f7f3b8",
+        "kind": "SYSTEM_MESSAGE",
+        "sequence_no": 0,
+        "source_role": "system",
+        "tool_call_id": null,
+        "tool_name": null,
+        "trust": "SYSTEM_TRUSTED"
+      },
+      {
+        "arguments_sha256": null,
+        "content_length": 68,
+        "content_sha256": "9c8baf0c52e5006b256ab16f140ff16433e2b099d16ea45bddf9b78b3ea59f3f",
+        "event_id": "evt_0001_5bc07a174fb06778",
+        "kind": "USER_MESSAGE",
+        "sequence_no": 1,
+        "source_role": "user",
+        "tool_call_id": null,
+        "tool_name": null,
+        "trust": "USER"
+      },
+      {
+        "arguments_sha256": "1f8a49983b08291107de73b3fed9e660ec28fc790cc5edd0a3283b0fb27940e0",
+        "content_length": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "event_id": "evt_0002_eae6a30fc2c2471a",
+        "kind": "TOOL_CALL",
+        "sequence_no": 2,
+        "source_role": "assistant",
+        "tool_call_id": "call_synth_01",
+        "tool_name": "list_files",
+        "trust": "MODEL_GENERATED"
+      },
+      {
+        "arguments_sha256": null,
+        "content_length": 36,
+        "content_sha256": "36ac5bb2695b52514e8c327bb18d0d117b81493bfc052315c0086a916f9f9017",
+        "event_id": "evt_0003_1eb97e2728f40c54",
+        "kind": "TOOL_RESULT",
+        "sequence_no": 3,
+        "source_role": "tool",
+        "tool_call_id": "call_synth_01",
+        "tool_name": "list_files",
+        "trust": "UNTRUSTED_EXTERNAL"
+      }
+    ],
+    "finish_reason": "stop",
     "generation_job": {
       "candidate_id": "cand_answer",
       "initial_user_request": "Synthetic user task: verify deterministic state and decision replay.",
@@ -90,7 +165,7 @@
       ]
     },
     "generation_semantics": {
-      "content": "[fake:answer] Processed request: Synthetic user task: verify deterministic state and decision replay. (with 1 evidence item(s))",
+      "content": "[fake:answer] Synthetic response for job_5fad1efc863d6b4b (with 1 evidence item(s))",
       "job_id": "job_5fad1efc863d6b4b",
       "job_type": "ANSWER",
       "model_id": "nvidia/nemotron",
@@ -104,7 +179,7 @@
           "finish_reason": "stop",
           "index": 0,
           "message": {
-            "content": "[fake:answer] Processed request: Synthetic user task: verify deterministic state and decision replay. (with 1 evidence item(s))",
+            "content": "[fake:answer] Synthetic response for job_5fad1efc863d6b4b (with 1 evidence item(s))",
             "role": "assistant",
             "tool_calls": null
           }
@@ -185,7 +260,11 @@
         "trust": "UNTRUSTED_EXTERNAL"
       }
     ],
+    "replayable": true,
+    "response_sha256": "bad5d2572be3d114c13d4c34db61c142eee47d8c666f69b4d20785e124bfb711",
     "state_digest": "a7d36c56c7a8cc66f8f7f235dcd694f721cda911f83c0f501263080e452d2bdd",
+    "tool_count": 1,
+    "trace_mode": "full_fidelity_replay",
     "versions": {
       "normalizer_version": "v1",
       "policy_version": "v1",
@@ -194,20 +273,21 @@
     }
   },
   "telemetry": {
-    "correlation_trace_id": "trc_fixture_001",
+    "correlation_trace_id": "trc_fixture_0001",
+    "created_timestamp": 1728345600,
     "decision_telemetry": {
       "completion_tokens": 0,
       "latency_ms": 1.5,
       "prompt_tokens": 0,
-      "request_attempt_id": "req_fixture_001"
+      "request_attempt_id": "req_fixture_0001"
     },
     "generation_telemetry": {
-      "completion_tokens": 16,
+      "completion_tokens": 9,
       "latency_ms": 2.0,
       "prompt_tokens": 9,
-      "request_attempt_id": "req_fixture_001"
+      "request_attempt_id": "req_fixture_0001"
     },
-    "operation_id": "op_fixture_001",
-    "request_id": "req_fixture_001"
+    "operation_id": "op_fixture_0001",
+    "request_id": "req_fixture_0001"
   }
 }

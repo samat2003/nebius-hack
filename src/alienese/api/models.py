@@ -26,6 +26,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from alienese.api.errors import CompatibilityError, ProtocolError
 
+PUBLIC_MODEL_ID = "alienese-default"
+SUPPORTED_PUBLIC_MODELS: frozenset[str] = frozenset({PUBLIC_MODEL_ID})
+
 
 class FunctionCallInput(BaseModel):
     """Function name and JSON-encoded arguments inside an assistant tool_call."""
@@ -151,6 +154,13 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_compatibility_and_protocol(self) -> ChatCompletionRequest:
+        if self.model not in SUPPORTED_PUBLIC_MODELS:
+            raise CompatibilityError(
+                f"Model '{self.model}' is not supported. Supported public model: "
+                f"'{PUBLIC_MODEL_ID}'.",
+                param="model",
+                code="model_not_supported",
+            )
         if not self.messages:
             raise ProtocolError(
                 "Request 'messages' must contain at least one message.",

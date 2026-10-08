@@ -57,7 +57,9 @@ async def test_openai_sdk_wire_protocol_interoperability() -> None:
         assert body["choices"][0]["index"] == 0
         assert body["choices"][0]["finish_reason"] == "stop"
         assert body["choices"][0]["message"]["role"] == "assistant"
-        assert "Verify OpenAI SDK wire compatibility" in body["choices"][0]["message"]["content"]
+        assert body["choices"][0]["message"]["content"].startswith(
+            "[fake:answer] Synthetic response for job_"
+        )
         assert set(body["usage"].keys()) == {"prompt_tokens", "completion_tokens", "total_tokens"}
 
 
@@ -89,4 +91,6 @@ async def test_openai_python_sdk_client_if_installed() -> None:
         )
         assert completion.id.startswith("chatcmpl-op_")
         assert completion.choices[0].finish_reason == "stop"
-        assert "Hello from real AsyncOpenAI client" in completion.choices[0].message.content
+        assert completion.choices[0].message.content.startswith(
+            "[fake:answer] Synthetic response for job_"
+        )

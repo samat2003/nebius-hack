@@ -1,12 +1,16 @@
-"""Single-turn deterministic orchestration engine for Alienese.
+"""TurnEngine: deterministic single-turn runtime orchestration.
 
-Enforces core runtime invariants:
-1. One external action per turn (either 1 assistant response OR 1 tool call).
-2. No model-to-model orchestration or recursive loops.
-3. Never fabricates tool arguments; validates `arguments_complete` and JSON Schema
-   before serializing any external tool call.
-4. Internal transitions (`CandidateDisposition.INTERNAL_TRANSITION`) can never
-   reach external serialization.
+Orchestrates:
+1. Protocol normalization (`normalize_request`)
+2. Deterministic `WorkingState` reconstruction (`reconstruct`)
+3. Finite deterministic `CandidateAction` construction (`build_deterministic_candidates`)
+4. Reserved Phase 3 retrieval hook (`_maybe_rank_candidates`, bypassed in Phase 1)
+5. `Controller.decide()` policy selection + executable candidate invariant validation
+6. Optional `Generator.generate()` execution for `GENERATION_JOB` candidates
+7. Single external action serialization (`_serialize_response`) without mutating
+   or redacting outgoing protocol tool arguments or assistant content
+8. Trace emission in `TraceMode.METADATA_ONLY` by default, or
+   `TraceMode.FULL_FIDELITY_REPLAY` when explicitly enabled for local replay.
 """
 
 from __future__ import annotations
@@ -15,7 +19,8 @@ import copy
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from alienese.api.errors import (
@@ -41,37 +46,77 @@ from alienese.contracts.candidates import (
 )
 from alienese.contracts.context import RequestContext
 from alienese.contracts.decisions import DecisionResult
+from alienese.contracts.events import NormalizedEvent
 from alienese.contracts.generation import (
     GenerationJob,
     GenerationJobType,
     GenerationResult,
 )
-from alienese.contracts.providers import (
-    Controller,
-    Generator,
-    RetrievalCandidateItem,
-    RetrievalRequest,
-    Retriever,
-)
+from alienese.contracts.providers import Controller, Generator, Retriever
 from alienese.contracts.state import (
     CanonicalCapability,
     ExternalToolBinding,
     WorkingState,
 )
 from alienese.contracts.traces import (
+    CandidateMetadataDigest,
     ComponentVersions,
+    EventMetadataDigest,
     ReplayArtifact,
     ReplaySemantics,
     ReplayTelemetry,
+    TraceMode,
 )
 from alienese.engine.normalize import normalize_request
 from alienese.engine.reconstruct import reconstruct
 from alienese.observability.logging import get_request_logger
-from alienese.observability.redaction import redact_mapping, redact_string
 from alienese.observability.tracing import RuntimeTracer
 from alienese.storage.traces import TraceStore, sanitize_replay_artifact
 
-_FIXED_LOGICAL_CREATED_EPOCH = 1728345600
+MAX_SCHEMA_DEPTH = 16
+
+_UNSUPPORTED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "$ref",
+        "$defs",
+        "definitions",
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "not",
+        "patternProperties",
+        "dependencies",
+        "dependentSchemas",
+        "dependentRequired",
+        "if",
+        "then",
+        "else",
+    }
+)
+
+
+def classify_tool_risk(capability: CanonicalCapability) -> RiskClass:
+    """Classify the risk level of a canonical tool capability conservatively.
+
+    Unknown (`UNKNOWN`) and unclassified (`CUSTOM_TOOL`) tools are classified
+    as `RiskClass.HIGH` so they are never treated as low-risk read operations.
+    """
+    if capability in (
+        CanonicalCapability.READ_FILE,
+        CanonicalCapability.SEARCH_TEXT,
+        CanonicalCapability.LIST_FILES,
+        CanonicalCapability.RESPOND,
+        CanonicalCapability.EXPLAIN_FAILURE,
+        CanonicalCapability.SYNTHESIZE_SEARCH,
+        CanonicalCapability.FINISH,
+    ):
+        return RiskClass.LOW
+    if capability in (
+        CanonicalCapability.RUN_TEST,
+        CanonicalCapability.WRITE_TEST,
+    ):
+        return RiskClass.MEDIUM
+    return RiskClass.HIGH
 
 
 def _matches_json_schema_type(value: Any, expected_type: str) -> bool:
@@ -101,7 +146,24 @@ def _validate_schema_node(
     value: Any,
     *,
     path: str,
+    depth: int = 0,
 ) -> tuple[bool, str | None]:
+    if depth > MAX_SCHEMA_DEPTH:
+        return (
+            False,
+            f"Schema validation exceeded maximum recursion depth ({MAX_SCHEMA_DEPTH}) at '{path}'.",
+        )
+
+    for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
+        if kw in schema:
+            return (
+                False,
+                f"Unsupported JSON Schema keyword '{kw}' at '{path}'.",
+            )
+
+    if "const" in schema and value != schema["const"]:
+        return False, f"Argument '{path}' did not match required const value."
+
     expected_type = schema.get("type")
     if isinstance(expected_type, str):
         if not _matches_json_schema_type(value, expected_type):
@@ -141,12 +203,25 @@ def _validate_schema_node(
             return False, f"Argument '{path}' exceeds maximum={maximum}."
 
     if isinstance(value, (list, tuple)):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            return False, f"Argument '{path}' has fewer than minItems={min_items}."
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(value) > max_items:
+            return False, f"Argument '{path}' exceeds maxItems={max_items}."
         items_schema = schema.get("items")
         if isinstance(items_schema, Mapping):
             for idx, elem in enumerate(value):
-                ok, reason = _validate_schema_node(items_schema, elem, path=f"{path}[{idx}]")
+                ok, reason = _validate_schema_node(
+                    items_schema,
+                    elem,
+                    path=f"{path}[{idx}]",
+                    depth=depth + 1,
+                )
                 if not ok:
                     return False, reason
+        elif items_schema is not None:
+            return False, f"Unsupported 'items' schema definition at '{path}'."
 
     if isinstance(value, Mapping):
         required_fields = schema.get("required", [])
@@ -162,6 +237,16 @@ def _validate_schema_node(
         if not isinstance(properties, Mapping):
             return False, f"Schema 'properties' field at '{path}' must be an object."
 
+        for prop_key, prop_spec in properties.items():
+            if not isinstance(prop_spec, Mapping):
+                return False, f"Property schema '{prop_key}' at '{path}' must be an object."
+            for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
+                if kw in prop_spec:
+                    return (
+                        False,
+                        f"Unsupported JSON Schema keyword '{kw}' at '{path}.{prop_key}'.",
+                    )
+
         additional_props = schema.get("additionalProperties", True)
         if additional_props is False:
             for arg_key in value:
@@ -170,12 +255,31 @@ def _validate_schema_node(
                         False,
                         f"Unexpected argument '{arg_key}' (additionalProperties=false).",
                     )
+        elif isinstance(additional_props, Mapping):
+            for arg_key, arg_val in value.items():
+                if arg_key not in properties:
+                    child_path = str(arg_key) if path == "$" else f"{path}.{arg_key}"
+                    ok, reason = _validate_schema_node(
+                        additional_props,
+                        arg_val,
+                        path=child_path,
+                        depth=depth + 1,
+                    )
+                    if not ok:
+                        return False, reason
+        elif additional_props is not True:
+            return False, f"Unsupported 'additionalProperties' definition at '{path}'."
 
         for arg_key, arg_val in value.items():
             prop_schema = properties.get(arg_key)
             if isinstance(prop_schema, Mapping):
                 child_path = str(arg_key) if path == "$" else f"{path}.{arg_key}"
-                ok, reason = _validate_schema_node(prop_schema, arg_val, path=child_path)
+                ok, reason = _validate_schema_node(
+                    prop_schema,
+                    arg_val,
+                    path=child_path,
+                    depth=depth + 1,
+                )
                 if not ok:
                     return False, reason
 
@@ -190,11 +294,15 @@ def validate_tool_arguments_against_schema(
     if not parameters_schema:
         return True, None
 
+    for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
+        if kw in parameters_schema:
+            return False, f"Unsupported JSON Schema keyword '{kw}' at '$'."
+
     schema_type = parameters_schema.get("type", "object")
     if schema_type != "object":
         return False, f"Unsupported top-level parameters schema type '{schema_type}'."
 
-    return _validate_schema_node(parameters_schema, arguments, path="$")
+    return _validate_schema_node(parameters_schema, arguments, path="$", depth=0)
 
 
 def extract_deterministic_tool_arguments(
@@ -205,13 +313,22 @@ def extract_deterministic_tool_arguments(
     if not schema:
         return {}, True
 
+    for kw in _UNSUPPORTED_SCHEMA_KEYWORDS:
+        if kw in schema:
+            return {}, False
+
     properties = schema.get("properties", {})
     extracted: dict[str, Any] = {}
     if isinstance(properties, Mapping):
         for prop_name, prop_def in properties.items():
             if isinstance(prop_def, Mapping) and "default" in prop_def:
                 default_val = copy.deepcopy(prop_def["default"])
-                ok, _ = _validate_schema_node(prop_def, default_val, path=str(prop_name))
+                ok, _ = _validate_schema_node(
+                    prop_def,
+                    default_val,
+                    path=str(prop_name),
+                    depth=1,
+                )
                 if ok:
                     extracted[str(prop_name)] = default_val
 
@@ -258,6 +375,7 @@ def build_deterministic_candidates(
                 param="tool_choice",
                 code="ungrounded_required_tool_arguments",
             )
+        tool_risk = classify_tool_risk(binding.canonical_capability)
         return (
             CandidateAction(
                 candidate_id=f"cand_tool_{binding.external_name}",
@@ -267,7 +385,7 @@ def build_deterministic_candidates(
                 arguments=args,
                 arguments_complete=True,
                 requires_generation=False,
-                risk_class=RiskClass.LOW,
+                risk_class=tool_risk,
                 cost_class=CostClass.LOW,
                 rationale=f"Explicitly requested tool '{binding.external_name}'.",
             ),
@@ -275,6 +393,7 @@ def build_deterministic_candidates(
 
     for binding in state.available_tools:
         args, is_complete = extract_deterministic_tool_arguments(binding)
+        tool_risk = classify_tool_risk(binding.canonical_capability)
         candidates.append(
             CandidateAction(
                 candidate_id=f"cand_tool_{binding.external_name}",
@@ -284,22 +403,26 @@ def build_deterministic_candidates(
                 arguments=args,
                 arguments_complete=is_complete,
                 requires_generation=False,
-                risk_class=RiskClass.LOW,
+                risk_class=tool_risk,
                 cost_class=CostClass.LOW,
                 rationale=f"Candidate for external tool '{binding.external_name}'.",
             )
         )
 
     if tool_choice == "required":
-        executable_tools = [c for c in candidates if c.arguments_complete]
-        if not executable_tools:
+        # Conservative fake-mode policy: generic `tool_choice="required"` only
+        # auto-selects low-risk tools with complete deterministic arguments.
+        safe_executable_tools = [
+            c for c in candidates if c.arguments_complete and c.risk_class == RiskClass.LOW
+        ]
+        if not safe_executable_tools:
             raise CompatibilityError(
-                "tool_choice='required' was specified, but no provided tool has "
+                "tool_choice='required' was specified, but no low-risk tool has "
                 "deterministically complete required arguments in Phase 1.",
                 param="tool_choice",
                 code="ungrounded_required_tool_arguments",
             )
-        return tuple(executable_tools)
+        return tuple(safe_executable_tools)
 
     candidates.append(answer_candidate)
     return tuple(candidates)
@@ -352,6 +475,57 @@ def _deterministic_tool_call_id(state_digest: str, candidate_id: str) -> str:
     return f"call_{short_hash}"
 
 
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_event_digests(events: Sequence[NormalizedEvent]) -> tuple[EventMetadataDigest, ...]:
+    digests: list[EventMetadataDigest] = []
+    for ev in events:
+        content_hash = hashlib.sha256(ev.content.encode("utf-8")).hexdigest()
+        args_hash = _canonical_sha256(ev.tool_arguments) if ev.tool_arguments is not None else None
+        digests.append(
+            EventMetadataDigest(
+                sequence_no=ev.sequence_no,
+                event_id=ev.event_id,
+                kind=ev.kind,
+                trust=ev.trust,
+                source_role=ev.provenance.source_role,
+                content_sha256=content_hash,
+                content_length=len(ev.content),
+                tool_name=ev.tool_name,
+                tool_call_id=ev.tool_call_id,
+                arguments_sha256=args_hash,
+            )
+        )
+    return tuple(digests)
+
+
+def _build_candidate_digests(
+    candidates: Sequence[CandidateAction],
+) -> tuple[CandidateMetadataDigest, ...]:
+    return tuple(
+        CandidateMetadataDigest(
+            candidate_id=cand.candidate_id,
+            canonical_intent=cand.canonical_intent,
+            disposition=cand.disposition,
+            external_tool_name=cand.external_tool_name,
+            arguments_complete=cand.arguments_complete,
+            requires_generation=cand.requires_generation,
+            generation_job_type=cand.generation_job_type,
+            risk_class=cand.risk_class,
+        )
+        for cand in candidates
+    )
+
+
 def _build_generation_job(
     state: WorkingState,
     selected: CandidateAction,
@@ -390,12 +564,30 @@ class TurnEngine:
         generator: Generator,
         trace_store: TraceStore | None = None,
         tracer: RuntimeTracer | None = None,
+        include_replay_content: bool = False,
+        clock: Callable[[], int] | None = None,
     ) -> None:
         self._retriever = retriever
         self._controller = controller
         self._generator = generator
         self._trace_store = trace_store
         self._tracer = tracer or RuntimeTracer()
+        self._include_replay_content = include_replay_content
+        self._clock: Callable[[], int] = clock or (lambda: int(time.time()))
+
+    async def _maybe_rank_candidates(
+        self,
+        ctx: RequestContext,
+        state: WorkingState,
+        candidates: Sequence[CandidateAction],
+    ) -> None:
+        """Explicit Phase 3 integration point for retrieval ranking.
+
+        In Phase 1, optional retrieval is bypassed rather than executing a
+        provider call whose ranking output is not consumed by policy selection.
+        """
+        _ = (ctx, state, candidates, self._retriever)
+        return None
 
     async def execute_turn(
         self,
@@ -446,24 +638,8 @@ class TurnEngine:
                 )
                 logger.info("candidates_constructed", candidate_count=len(candidates))
 
-            # Optional retrieval ranking over candidates when > 1 candidate
-            if len(candidates) > 1:
-                retrieval_items = tuple(
-                    RetrievalCandidateItem(
-                        item_id=c.candidate_id,
-                        content=f"{c.canonical_intent.value}:{c.external_tool_name or ''}",
-                        mandatory=c.disposition == CandidateDisposition.GENERATION_JOB,
-                    )
-                    for c in candidates
-                )
-                await self._retriever.rank(
-                    ctx,
-                    RetrievalRequest(
-                        query=state.latest_user_request or "",
-                        items=retrieval_items,
-                        max_results=len(candidates),
-                    ),
-                )
+            # Phase 3 retrieval hook (bypassed in Phase 1)
+            await self._maybe_rank_candidates(ctx, state, candidates)
 
             # 4. Controller policy decision
             with self._tracer.span("policy.decide") as decide_span:
@@ -513,7 +689,8 @@ class TurnEngine:
                         job_type=gen_job.job_type.value,
                     )
 
-            # 6. Serialize exactly one external action
+            # 6. Serialize exactly one external action (without redacting outgoing protocol fields)
+            created_ts = self._clock()
             with self._tracer.span("protocol.serialize") as ser_span:
                 response, logical_response = self._serialize_response(
                     ctx=ctx,
@@ -521,6 +698,7 @@ class TurnEngine:
                     state=state,
                     selected=selected,
                     gen_result=gen_result,
+                    created_timestamp=created_ts,
                 )
                 self._tracer.set_attributes_safe(
                     ser_span,
@@ -531,32 +709,66 @@ class TurnEngine:
                     finish_reason=response.choices[0].finish_reason,
                 )
 
+            finish_reason = response.choices[0].finish_reason
+            event_digests = _build_event_digests(events)
+            candidate_digests = _build_candidate_digests(candidates)
+            response_sha256 = _canonical_sha256(logical_response)
+
+            if self._include_replay_content:
+                raw_semantics = ReplaySemantics(
+                    trace_mode=TraceMode.FULL_FIDELITY_REPLAY,
+                    replayable=True,
+                    versions=ComponentVersions(),
+                    state_digest=state.state_digest,
+                    event_count=len(events),
+                    tool_count=len(tools),
+                    candidate_count=len(candidates),
+                    event_digests=event_digests,
+                    candidate_digests=candidate_digests,
+                    decision_semantics=decision.semantics,
+                    finish_reason=finish_reason,
+                    response_sha256=response_sha256,
+                    normalized_events=events,
+                    available_tools=tools,
+                    candidates=candidates,
+                    generation_job=gen_job,
+                    generation_semantics=gen_result.semantics if gen_result else None,
+                    logical_response=logical_response,
+                )
+            else:
+                raw_semantics = ReplaySemantics(
+                    trace_mode=TraceMode.METADATA_ONLY,
+                    replayable=False,
+                    versions=ComponentVersions(),
+                    state_digest=state.state_digest,
+                    event_count=len(events),
+                    tool_count=len(tools),
+                    candidate_count=len(candidates),
+                    event_digests=event_digests,
+                    candidate_digests=candidate_digests,
+                    decision_semantics=decision.semantics,
+                    finish_reason=finish_reason,
+                    response_sha256=response_sha256,
+                )
+
             artifact = sanitize_replay_artifact(
                 ReplayArtifact(
-                    semantics=ReplaySemantics(
-                        versions=ComponentVersions(),
-                        normalized_events=events,
-                        available_tools=tools,
-                        state_digest=state.state_digest,
-                        candidates=candidates,
-                        decision_semantics=decision.semantics,
-                        generation_job=gen_job,
-                        generation_semantics=gen_result.semantics if gen_result else None,
-                        logical_response=logical_response,
-                    ),
+                    semantics=raw_semantics,
                     telemetry=ReplayTelemetry(
                         request_id=ctx.request_id,
                         operation_id=ctx.operation_id,
                         correlation_trace_id=ctx.correlation_trace_id,
+                        created_timestamp=created_ts,
                         decision_telemetry=decision.telemetry,
                         generation_telemetry=gen_result.telemetry if gen_result else None,
                     ),
-                )
+                ),
+                allow_full_fidelity=self._include_replay_content,
             )
 
             if self._trace_store is not None:
                 try:
-                    await self._trace_store.save(artifact)
+                    artifact = await self._trace_store.save(artifact)
                 except Exception:
                     logger.warning("trace_store_save_failed")
 
@@ -570,13 +782,13 @@ class TurnEngine:
         state: WorkingState,
         selected: CandidateAction,
         gen_result: GenerationResult | None,
+        created_timestamp: int,
     ) -> tuple[ChatCompletionResponse, dict[str, Any]]:
         if selected.disposition == CandidateDisposition.EXTERNAL_TOOL:
             assert selected.external_tool_name is not None
             call_id = _deterministic_tool_call_id(state.state_digest, selected.candidate_id)
-            safe_args = redact_mapping(selected.arguments)
             serialized_args = json.dumps(
-                safe_args,
+                selected.arguments,
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
@@ -606,8 +818,7 @@ class TurnEngine:
             CandidateDisposition.GENERATION_JOB,
             CandidateDisposition.ASSISTANT_RESPONSE,
         ):
-            raw_content = gen_result.content if gen_result is not None else selected.rationale
-            content = redact_string(raw_content)
+            content = gen_result.content if gen_result is not None else selected.rationale
             if not content:
                 raise InvariantViolation("Assistant response candidate produced empty content.")
             assistant_msg = AssistantMessageOutput(
@@ -634,7 +845,7 @@ class TurnEngine:
 
         response = ChatCompletionResponse(
             id=f"chatcmpl-{ctx.operation_id}",
-            created=_FIXED_LOGICAL_CREATED_EPOCH,
+            created=created_timestamp,
             model=request.model,
             choices=[choice],
             usage=usage,

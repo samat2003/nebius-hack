@@ -433,4 +433,4 @@ async def test_regression_non_utf8_request_body_and_secret_non_reflection() -> N
         assert secret_resp.status_code == 200
         content = secret_resp.json()["choices"][0]["message"]["content"]
         assert sk_val not in content
-        assert REDACTED_PLACEHOLDER in content
+        assert content.startswith("[fake:answer] Synthetic response for job_")
