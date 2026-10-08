@@ -54,7 +54,7 @@ class RetrievalSemantics(BaseModel):
     ranked_items: tuple[RankedItem, ...]
     provider_name: str = Field(min_length=1)
     model_id: str = Field(min_length=1)
-    model_revision: str = Field(default="fake-v1", min_length=1)
+    model_revision: str = Field(default="unknown", min_length=1)
 
 
 class RetrievalResult(BaseModel):

@@ -15,6 +15,7 @@ authors = [
 dependencies = [
     "fastapi>=0.115.0,<1.0.0",
     "uvicorn>=0.30.0,<1.0.0",
+    "httpx>=0.27.0,<1.0.0",
     "pydantic>=2.9.0,<3.0.0",
     "pydantic-settings>=2.5.0,<3.0.0",
     "structlog>=24.4.0,<26.0.0",
@@ -72,4 +73,8 @@ warn_required_dynamic_aliases = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-addopts = "-ra -q"
+markers = [
+    "live_nvidia: Opt-in live NVIDIA API Catalog integration tests (requires RUN_LIVE_NVIDIA_TESTS=1)",
+]
+addopts = "-ra -q --strict-markers -m 'not live_nvidia'"
+

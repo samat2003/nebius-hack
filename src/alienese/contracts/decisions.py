@@ -6,14 +6,26 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProviderCallTelemetry(BaseModel):
-    """Operational telemetry excluded from deterministic replay equality comparisons."""
+    """Operational telemetry excluded from deterministic replay equality comparisons.
+
+    Uses `None` for unknown token counts or unverified pricing rather than
+    fabricating numerical zero measurements.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     latency_ms: float = Field(default=0.0, ge=0.0)
     request_attempt_id: str | None = None
-    prompt_tokens: int = Field(default=0, ge=0)
-    completion_tokens: int = Field(default=0, ge=0)
+    upstream_request_id: str | None = None
+    serving_fingerprint: str | None = None
+    attempt_count: int = Field(default=1, ge=1)
+    failed_attempt_count: int = Field(default=0, ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    retried_prompt_tokens: int | None = Field(default=None, ge=0)
+    retried_completion_tokens: int | None = Field(default=None, ge=0)
+    estimated_cost_usd: float | None = Field(default=None, ge=0.0)
 
 
 class CandidateScore(BaseModel):
@@ -45,7 +57,7 @@ class DecisionSemantics(BaseModel):
     scores: tuple[CandidateScore, ...] = ()
     provider_name: str = Field(min_length=1)
     model_id: str = Field(min_length=1)
-    model_revision: str = Field(default="fake-v1", min_length=1)
+    model_revision: str = Field(default="unknown", min_length=1)
     guard_metadata: GuardMetadata = Field(default_factory=GuardMetadata)
 
 

@@ -71,6 +71,10 @@ from alienese.engine.normalize import normalize_request
 from alienese.engine.reconstruct import reconstruct
 from alienese.observability.logging import get_request_logger
 from alienese.observability.tracing import RuntimeTracer
+from alienese.providers.runtime.deadlines import (
+    DEFAULT_TURN_TIMEOUT_SECONDS,
+    DeadlineBudget,
+)
 from alienese.storage.traces import TraceStore, sanitize_replay_artifact
 
 MAX_SCHEMA_DEPTH = 16
@@ -729,6 +733,8 @@ class TurnEngine:
         tracer: RuntimeTracer | None = None,
         include_replay_content: bool = False,
         clock: Callable[[], int] | None = None,
+        turn_timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         self._retriever = retriever
         self._controller = controller
@@ -737,6 +743,18 @@ class TurnEngine:
         self._tracer = tracer or RuntimeTracer()
         self._include_replay_content = include_replay_content
         self._clock: Callable[[], int] = clock or (lambda: int(time.time()))
+        self._turn_timeout_seconds = turn_timeout_seconds
+        self._monotonic_clock: Callable[[], float] = monotonic_clock or time.monotonic
+
+    @property
+    def turn_timeout_seconds(self) -> float:
+        """Maximum duration in seconds for a logical turn execution."""
+        return self._turn_timeout_seconds
+
+    @property
+    def monotonic_clock(self) -> Callable[[], float]:
+        """Monotonic clock callable used by this engine."""
+        return self._monotonic_clock
 
     async def _maybe_rank_candidates(
         self,
@@ -746,7 +764,7 @@ class TurnEngine:
     ) -> None:
         """Explicit Phase 3 integration point for retrieval ranking.
 
-        In Phase 1, optional retrieval is bypassed rather than executing a
+        In Phase 1/2, optional retrieval is bypassed rather than executing a
         provider call whose ranking output is not consumed by policy selection.
         """
         _ = (ctx, state, candidates, self._retriever)
@@ -758,6 +776,16 @@ class TurnEngine:
         request: ChatCompletionRequest,
     ) -> tuple[ChatCompletionResponse, ReplayArtifact]:
         """Run a single turn from request normalization to response serialization."""
+        turn_limit_deadline = self._monotonic_clock() + self._turn_timeout_seconds
+        if ctx.deadline_monotonic is None or turn_limit_deadline < ctx.deadline_monotonic:
+            ctx = ctx.model_copy(update={"deadline_monotonic": turn_limit_deadline})
+        deadline = DeadlineBudget.from_context(
+            ctx,
+            default_timeout_seconds=self._turn_timeout_seconds,
+            clock=self._monotonic_clock,
+        )
+        deadline.require_remaining(provider_name="turn_engine", phase="turn_start")
+
         logger = get_request_logger(ctx, "engine.turn")
 
         with self._tracer.start_turn_span(ctx, attributes={"model": request.model}):
@@ -801,10 +829,11 @@ class TurnEngine:
                 )
                 logger.info("candidates_constructed", candidate_count=len(candidates))
 
-            # Phase 3 retrieval hook (bypassed in Phase 1)
+            # Phase 3 retrieval hook (bypassed in Phase 1/2)
             await self._maybe_rank_candidates(ctx, state, candidates)
 
             # 4. Controller policy decision
+            deadline.require_remaining(provider_name="turn_engine", phase="controller_decide")
             with self._tracer.span("policy.decide") as decide_span:
                 decision: DecisionResult = await self._controller.decide(ctx, state, candidates)
                 candidates_by_id = {c.candidate_id: c for c in candidates}
@@ -832,6 +861,7 @@ class TurnEngine:
             gen_job: GenerationJob | None = None
             gen_result: GenerationResult | None = None
             if selected.disposition == CandidateDisposition.GENERATION_JOB:
+                deadline.require_remaining(provider_name="turn_engine", phase="generator_generate")
                 with self._tracer.span("generation") as gen_span:
                     gen_job = _build_generation_job(state, selected, request)
                     gen_result = await self._generator.generate(ctx, gen_job)
@@ -947,6 +977,7 @@ class TurnEngine:
         gen_result: GenerationResult | None,
         created_timestamp: int,
     ) -> tuple[ChatCompletionResponse, dict[str, Any]]:
+        usage: UsageInfo | None = None
         if selected.disposition == CandidateDisposition.EXTERNAL_TOOL:
             assert selected.external_tool_name is not None
             call_id = _deterministic_tool_call_id(state.state_digest, selected.candidate_id)
@@ -976,7 +1007,6 @@ class TurnEngine:
                 message=assistant_msg,
                 finish_reason="tool_calls",
             )
-            usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
         elif selected.disposition in (
             CandidateDisposition.GENERATION_JOB,
             CandidateDisposition.ASSISTANT_RESPONSE,
@@ -994,13 +1024,23 @@ class TurnEngine:
                 message=assistant_msg,
                 finish_reason="stop",
             )
-            p_tok = gen_result.telemetry.prompt_tokens if gen_result else 0
-            c_tok = gen_result.telemetry.completion_tokens if gen_result else 0
-            usage = UsageInfo(
-                prompt_tokens=p_tok,
-                completion_tokens=c_tok,
-                total_tokens=p_tok + c_tok,
-            )
+            if (
+                gen_result is not None
+                and gen_result.telemetry.prompt_tokens is not None
+                and gen_result.telemetry.completion_tokens is not None
+            ):
+                p_tok = gen_result.telemetry.prompt_tokens
+                c_tok = gen_result.telemetry.completion_tokens
+                t_tok = (
+                    gen_result.telemetry.total_tokens
+                    if gen_result.telemetry.total_tokens is not None
+                    else (p_tok + c_tok)
+                )
+                usage = UsageInfo(
+                    prompt_tokens=p_tok,
+                    completion_tokens=c_tok,
+                    total_tokens=t_tok,
+                )
         else:
             raise InvariantViolation(
                 f"Unsupported disposition '{selected.disposition}' reached response serialization."

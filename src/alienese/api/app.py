@@ -8,6 +8,9 @@ Exposes:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -25,6 +28,12 @@ from alienese.engine.turn import TurnEngine
 from alienese.observability.logging import configure_logging, get_request_logger
 from alienese.observability.tracing import RuntimeTracer
 from alienese.providers.fake import FakeController, FakeGenerator, FakeRetriever
+from alienese.providers.generator.nebius_token_factory import NebiusTokenFactoryGenerator
+from alienese.providers.generator.nvidia_build import NvidiaBuildGenerator
+from alienese.providers.runtime.circuit_breaker import ProviderCircuitBreaker
+from alienese.providers.runtime.client import ProviderHttpClient
+from alienese.providers.runtime.concurrency import ProviderConcurrencyLimiter
+from alienese.providers.runtime.retry import RetryConfig
 from alienese.storage.idempotency import IdempotencyStore, InMemoryIdempotencyStore
 from alienese.storage.traces import InMemoryTraceStore, TraceStore
 
@@ -38,6 +47,57 @@ def _extract_request_context(request: Request) -> RequestContext:
         x_trace_id=request.headers.get("X-Trace-ID"),
         traceparent=request.headers.get("traceparent"),
         idempotency_key=request.headers.get("Idempotency-Key"),
+    )
+
+
+def build_generator_from_settings(cfg: Settings) -> Generator:
+    """Construct the configured Generator provider strictly according to `cfg`."""
+    mode = cfg.alienese_provider_mode.strip().lower()
+    if mode == "fake":
+        return FakeGenerator(model_id=cfg.effective_generator_model)
+
+    gen_prov = cfg.generator_provider.strip().lower()
+    assert cfg.generator_api_key is not None
+
+    http_client = ProviderHttpClient(
+        provider_name=gen_prov,
+        base_url=cfg.effective_generator_base_url,
+        api_key=cfg.generator_api_key,
+        default_timeout_seconds=cfg.provider_timeout_seconds,
+        retry_config=RetryConfig(
+            max_attempts=cfg.provider_max_attempts,
+            retry_ambiguous_failures=cfg.provider_retry_ambiguous,
+        ),
+        circuit_breaker=ProviderCircuitBreaker(
+            provider_name=gen_prov,
+            failure_threshold=cfg.provider_cb_failure_threshold,
+            recovery_timeout_seconds=cfg.provider_cb_recovery_seconds,
+        ),
+        concurrency_limiter=ProviderConcurrencyLimiter(
+            provider_name=gen_prov,
+            max_concurrency=cfg.provider_max_concurrency,
+            max_queue_waiters=cfg.provider_max_queue_waiters,
+        ),
+    )
+
+    if gen_prov == "nvidia_build":
+        return NvidiaBuildGenerator(
+            http_client=http_client,
+            model_id=cfg.effective_generator_model,
+            default_max_tokens=cfg.generator_max_tokens,
+            enable_thinking=cfg.generator_enable_thinking,
+        )
+    if gen_prov == "nebius_token_factory":
+        return NebiusTokenFactoryGenerator(
+            http_client=http_client,
+            model_id=cfg.effective_generator_model,
+            default_max_tokens=cfg.generator_max_tokens,
+        )
+
+    raise CompatibilityError(
+        f"Unsupported GENERATOR_PROVIDER '{cfg.generator_provider}'.",
+        param="generator_provider",
+        code="invalid_provider_mode_combination",
     )
 
 
@@ -57,7 +117,7 @@ def create_app(
 
     eff_retriever = retriever or FakeRetriever(model_id=cfg.retriever_model)
     eff_controller = controller or FakeController(model_id=cfg.controller_model)
-    eff_generator = generator or FakeGenerator(model_id=cfg.generator_model)
+    eff_generator = generator or build_generator_from_settings(cfg)
     eff_idem_store = idempotency_store or InMemoryIdempotencyStore(
         max_entries=cfg.idempotency_max_entries,
         ttl_seconds=cfg.idempotency_ttl_seconds,
@@ -73,24 +133,45 @@ def create_app(
     )
     eff_tracer = tracer or RuntimeTracer()
 
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            for provider_obj in (eff_generator, eff_controller, eff_retriever):
+                aclose_fn = getattr(provider_obj, "aclose", None)
+                if callable(aclose_fn):
+                    await aclose_fn()
+
     app = FastAPI(
         title="Alienese Runtime",
         version=__version__,
         docs_url=None,
         redoc_url=None,
+        lifespan=_lifespan,
     )
 
-    app.state.settings = cfg
-    app.state.trace_store = eff_trace_store
-    app.state.idempotency_store = eff_idem_store
-    app.state.idempotency = IdempotencyCoordinator(eff_idem_store)
-    app.state.turn_engine = TurnEngine(
+    turn_engine = TurnEngine(
         retriever=eff_retriever,
         controller=eff_controller,
         generator=eff_generator,
         trace_store=eff_trace_store,
         tracer=eff_tracer,
         include_replay_content=cfg.alienese_trace_content,
+        turn_timeout_seconds=cfg.provider_timeout_seconds,
+    )
+    app.state.settings = cfg
+    app.state.generator = eff_generator
+    app.state.controller = eff_controller
+    app.state.retriever = eff_retriever
+    app.state.trace_store = eff_trace_store
+    app.state.idempotency_store = eff_idem_store
+    app.state.turn_engine = turn_engine
+    app.state.idempotency = IdempotencyCoordinator(
+        eff_idem_store,
+        request_deadline_seconds=cfg.request_deadline_seconds,
+        wait_timeout_seconds=cfg.idempotency_wait_timeout_seconds,
+        clock=turn_engine.monotonic_clock,
     )
 
     @app.exception_handler(AlieneseError)
