@@ -39,15 +39,17 @@ To satisfy Invariants 7, 8, 9, and 14 in `AGENTS.md` without altering the core P
 - `ProviderHttpClient` classifies failures into `SAFE_RETRYABLE_TRANSPORT`, `SAFE_RETRYABLE_UPSTREAM`, `RATE_LIMITED` (`429`), `AMBIGUOUS_COMPLETION` (`ReadTimeout`, `WriteTimeout`, `RemoteProtocolError`), `LOCAL_SATURATION` (`PoolTimeout`, local concurrency queue timeout), and `NON_RETRYABLE_CONTRACT`. By default (`retry_ambiguous_failures=False`), `AMBIGUOUS_COMPLETION` errors fail fast without automatic retry.
 - `ProviderCircuitBreaker` checks admission before every attempt (including retries), counts each failed upstream outage attempt, excludes `LOCAL_SATURATION` and `RATE_LIMITED` (`429`), and admits at most one concurrent probe (`half_open_max_probes=1`) in `HALF_OPEN` state.
 
-### 4. Explicit Provider Mode Matrix
+### 4. Explicit Provider Mode Matrix, Isolated Credentials, & Strict Origin Allowlists
 
-- `ALIENESE_PROVIDER_MODE` defaults to `"fake"`. Even when `.env` contains live `GENERATOR_API_KEY` credentials, `fake` mode keeps all providers in-process (`FakeRetriever`, `FakeController`, `FakeGenerator`) and makes zero network calls.
-- `ALIENESE_PROVIDER_MODE="hybrid"` enables the configured remote generator (`GENERATOR_PROVIDER="nvidia_build"` or `"nebius_token_factory"`) while enforcing `RETRIEVER_PROVIDER="fake"` and `CONTROLLER_PROVIDER="fake"`.
+- `ALIENESE_PROVIDER_MODE` defaults to `"fake"`. Even when `.env` contains live `GENERATOR_API_KEY` and `NEBIUS_TOKEN_FACTORY_KEY` credentials, `fake` mode keeps all providers in-process (`FakeRetriever`, `FakeController`, `FakeGenerator`) and makes zero network calls.
+- `ALIENESE_PROVIDER_MODE="hybrid"` enables the configured remote generator while enforcing `RETRIEVER_PROVIDER="fake"` and `CONTROLLER_PROVIDER="fake"`:
+  - `GENERATOR_PROVIDER="nvidia_build"` resolves `GENERATOR_API_KEY`, `GENERATOR_BASE_URL` (default `https://integrate.api.nvidia.com/v1`), and `GENERATOR_MODEL` (default `nvidia/nemotron-3-super-120b-a12b`), restricted to the explicit origin allowlist `{"integrate.api.nvidia.com"}`.
+  - `GENERATOR_PROVIDER="nebius_token_factory"` resolves `NEBIUS_TOKEN_FACTORY_KEY`, `NEBIUS_TOKEN_FACTORY_BASE_URL` (default `https://api.tokenfactory.us-central1.nebius.com/v1`), and `NEBIUS_TOKEN_FACTORY_MODEL` (default `nvidia/nemotron-3-super-120b-a12b`), restricted to the explicit origin allowlist `{"api.tokenfactory.us-central1.nebius.com", "api.tokenfactory.nebius.com"}`.
+  - Cross-provider credential reuse (`nvapi-*` on Nebius or Nebius keys on NVIDIA) and unallowlisted wildcard subdomains are rejected before serving (`CompatibilityError`).
 - `ALIENESE_PROVIDER_MODE="remote"` is explicitly rejected with `CompatibilityError` until `mini-Jev` and `EmbeddingGemma 2` hosting endpoints are integrated in subsequent phases.
 
 ## Consequences
 
-- Default `pytest` execution remains 100% offline and deterministic even on developer workstations with `.env` populated.
-- Switching between `nvidia_build` and `nebius_token_factory` requires only configuration changes (`GENERATOR_PROVIDER`, `GENERATOR_API_KEY`, `GENERATOR_BASE_URL`, `GENERATOR_MODEL`) with zero changes to `TurnEngine`, `WorkingState`, or the public OpenAI-compatible API.
+- Default `pytest` execution remains 100% offline and deterministic even on developer workstations with `.env` populated (`-m 'not live_nvidia and not live_nebius'`).
+- Switching between `nvidia_build` and `nebius_token_factory` requires only setting `GENERATOR_PROVIDER` with zero changes to `TurnEngine`, `WorkingState`, or the public OpenAI-compatible API, while keeping NVIDIA and Nebius credentials strictly isolated.
 - Telemetry artifacts never fabricate zero token usage, zero USD cost, or fake model revisions when measurements are unavailable.
-

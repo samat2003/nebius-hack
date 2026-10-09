@@ -36,12 +36,14 @@ _SENSITIVE_KEY_NAMES: frozenset[str] = frozenset(
         "retriever_api_key",
         "controller_api_key",
         "generator_api_key",
+        "nebius_token_factory_key",
     }
 )
 
 _SENSITIVE_KEY_SUFFIXES: tuple[str, ...] = (
     "_api_key",
     "_apikey",
+    "_factory_key",
     "_token",
     "_secret",
     "_password",
@@ -56,7 +58,8 @@ _PEM_PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
 )
 _KNOWN_TOKEN_PREFIX_PATTERN = re.compile(
-    r"\b(?:sk|rk|pk|nvapi)-[A-Za-z0-9_-]{12,}\b"
+    r"\b(?:sk|rk|pk|nvapi|nebius)-[A-Za-z0-9_-]{12,}\b"
+    r"|\bv1\.[A-Za-z0-9._~+/=-]{20,}\b"
     r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}\b"
     r"|\bgithub_pat_[A-Za-z0-9_]{16,}\b"
     r"|\bhf_[A-Za-z0-9]{16,}\b"
@@ -64,11 +67,11 @@ _KNOWN_TOKEN_PREFIX_PATTERN = re.compile(
     r"|\bAIza[0-9A-Za-z_-]{20,}\b"
 )
 _JSON_KEY_VALUE_PATTERN = re.compile(
-    r'(?i)("(?:[a-z0-9_]*_)?(?:api[_-]?key|apikey|secret|token|password|private_key|authorization)"\s*:\s*")'
+    r'(?i)("(?:[a-z0-9_]*_)?(?:api[_-]?key|apikey|factory_key|secret|token|password|private_key|authorization)"\s*:\s*")'
     r'(?!\[REDACTED\])([^"]{4,})(")'
 )
 _INLINE_KEY_VALUE_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|apikey|secret|token|password|authorization)\s*([:=])\s*"
+    r"(?i)\b(api[_-]?key|apikey|factory_key|secret|token|password|authorization)\s*([:=])\s*"
     r"(?!Bearer\b|Basic\b|\[REDACTED\])([^\s,;\x22\x27&]{6,})"
 )
 

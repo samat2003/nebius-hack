@@ -1,11 +1,12 @@
-"""Nebius Token Factory Generator adapter for Nemotron portability.
+"""Nebius Token Factory Generator adapter for Nemotron 3 Super.
 
 Implements the same `Generator` protocol as `NvidiaBuildGenerator` so switching
 between NVIDIA API Catalog and Nebius Token Factory requires no changes to the
 Alienese public API or `TurnEngine` orchestration.
 
-Live verification status: `PENDING_CREDENTIALS` (verified offline via mocked
-transport and behavioral parity tests).
+Live verification status: `LIVE_VERIFIED` against
+`https://api.tokenfactory.us-central1.nebius.com/v1` with model
+`nvidia/nemotron-3-super-120b-a12b`.
 """
 
 from __future__ import annotations
@@ -22,37 +23,41 @@ from alienese.contracts.generation import (
     GenerationSemantics,
 )
 from alienese.providers.generator.nvidia_build import (
+    NVIDIA_NEMOTRON_SUPER_MODEL,
     build_generation_messages,
     parse_and_validate_chat_completion,
 )
 from alienese.providers.runtime.client import ProviderHttpClient
 
-NEBIUS_DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1"
+NEBIUS_DEFAULT_BASE_URL = "https://api.tokenfactory.us-central1.nebius.com/v1"
 MAX_NEBIUS_GENERATION_TOKENS = 16_384
+ALLOWED_NEBIUS_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.tokenfactory.us-central1.nebius.com",
+        "api.tokenfactory.nebius.com",
+    }
+)
 
 
 def _is_valid_nebius_host(hostname: str, *, allow_test_hosts: bool) -> bool:
     host = hostname.lower()
-    if (
-        host == "api.tokenfactory.nebius.com"
-        or host.endswith(".nebius.com")
-        or host.endswith(".nebius.ai")
-    ):
+    if host in ALLOWED_NEBIUS_HOSTS:
         return True
     return bool(allow_test_hosts and host in {"127.0.0.1", "localhost", "::1", "testserver"})
 
 
 class NebiusTokenFactoryGenerator:
-    """Portability Generator adapter for Nebius Token Factory."""
+    """Operational Generator adapter backed by Nebius Token Factory."""
 
     def __init__(
         self,
         *,
         http_client: ProviderHttpClient,
-        model_id: str,
+        model_id: str = NVIDIA_NEMOTRON_SUPER_MODEL,
         default_max_tokens: int = 1024,
         default_temperature: float = 0.7,
         default_top_p: float = 0.95,
+        enable_thinking: bool = False,
         allow_test_hosts: bool = False,
     ) -> None:
         self._provider_name = "nebius_token_factory"
@@ -75,12 +80,19 @@ class NebiusTokenFactoryGenerator:
                 param="temperature",
                 code="unsupported_temperature",
             )
+        if enable_thinking and default_temperature <= 0.0:
+            raise CompatibilityError(
+                "Nebius Nemotron thinking mode requires temperature > 0.0.",
+                param="temperature",
+                code="unsupported_temperature_for_thinking",
+            )
 
         parsed_host = (urlparse(http_client.base_url).hostname or "").lower()
         if not _is_valid_nebius_host(parsed_host, allow_test_hosts=allow_test_hosts):
             raise CompatibilityError(
                 "NebiusTokenFactoryGenerator requires a Nebius Token Factory origin "
-                f"('api.tokenfactory.nebius.com'), got host '{parsed_host}'.",
+                f"('api.tokenfactory.us-central1.nebius.com' or 'api.tokenfactory.nebius.com'), "
+                f"got host '{parsed_host}'.",
                 param="generator_base_url",
                 code="provider_origin_mismatch",
             )
@@ -90,6 +102,7 @@ class NebiusTokenFactoryGenerator:
         self._default_max_tokens = default_max_tokens
         self._default_temperature = default_temperature
         self._default_top_p = default_top_p
+        self._enable_thinking = enable_thinking
 
     @property
     def provider_name(self) -> str:
@@ -124,6 +137,12 @@ class NebiusTokenFactoryGenerator:
                 param="temperature",
                 code="unsupported_temperature",
             )
+        if self._enable_thinking and temperature <= 0.0:
+            raise CompatibilityError(
+                "Nebius Nemotron thinking mode requires temperature > 0.0.",
+                param="temperature",
+                code="unsupported_temperature_for_thinking",
+            )
 
         max_tokens = job.max_tokens if job.max_tokens is not None else self._default_max_tokens
         if not (1 <= max_tokens <= MAX_NEBIUS_GENERATION_TOKENS):
@@ -142,6 +161,7 @@ class NebiusTokenFactoryGenerator:
             "top_p": self._default_top_p,
             "max_tokens": max_tokens,
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": self._enable_thinking},
         }
 
         http_resp = await self._http.post_json(

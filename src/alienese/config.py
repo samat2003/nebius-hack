@@ -15,8 +15,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from alienese.api.errors import CompatibilityError
 from alienese.observability.redaction import REDACTED_PLACEHOLDER, redact_mapping
-from alienese.providers.generator.nebius_token_factory import NEBIUS_DEFAULT_BASE_URL
+from alienese.providers.generator.nebius_token_factory import (
+    ALLOWED_NEBIUS_HOSTS,
+    NEBIUS_DEFAULT_BASE_URL,
+)
 from alienese.providers.generator.nvidia_build import (
+    ALLOWED_NVIDIA_HOSTS,
     NVIDIA_DEFAULT_BASE_URL,
     NVIDIA_NEMOTRON_SUPER_MODEL,
 )
@@ -177,8 +181,8 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="CONTROLLER_API_KEY",
     )
-    controller_base_url: str | None = Field(
-        default=None,
+    controller_base_url: str = Field(
+        default="",
         validation_alias="CONTROLLER_BASE_URL",
     )
     controller_model: str = Field(
@@ -203,6 +207,18 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="GENERATOR_MODEL",
     )
+    nebius_token_factory_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="NEBIUS_TOKEN_FACTORY_KEY",
+    )
+    nebius_token_factory_base_url: str | None = Field(
+        default=None,
+        validation_alias="NEBIUS_TOKEN_FACTORY_BASE_URL",
+    )
+    nebius_token_factory_model: str | None = Field(
+        default=None,
+        validation_alias="NEBIUS_TOKEN_FACTORY_MODEL",
+    )
     generator_max_tokens: int = Field(
         default=1024,
         ge=1,
@@ -221,25 +237,49 @@ class Settings(BaseSettings):
     )
 
     @property
+    def effective_generator_api_key(self) -> SecretStr | None:
+        """Resolve the strictly isolated credential for the active generator provider."""
+        if self.alienese_provider_mode.strip().lower() == "fake":
+            return None
+        gen_prov = self.generator_provider.strip().lower()
+        if gen_prov == "nvidia_build":
+            return self.generator_api_key
+        if gen_prov == "nebius_token_factory":
+            return self.nebius_token_factory_key
+        return None
+
+    @property
     def effective_generator_model(self) -> str:
         """Return the resolved generator model identifier for the configured provider."""
         if self.alienese_provider_mode.strip().lower() == "fake":
             return "nvidia/nemotron"
+        gen_prov = self.generator_provider.strip().lower()
+        if gen_prov == "nebius_token_factory":
+            if self.nebius_token_factory_model and self.nebius_token_factory_model.strip():
+                return self.nebius_token_factory_model.strip()
+            if self.generator_model and self.generator_model.strip():
+                return self.generator_model.strip()
+            return NVIDIA_NEMOTRON_SUPER_MODEL
         if self.generator_model and self.generator_model.strip():
             return self.generator_model.strip()
-        if self.generator_provider.strip().lower() == "nvidia_build":
+        if gen_prov == "nvidia_build":
             return NVIDIA_NEMOTRON_SUPER_MODEL
         return "nvidia/nemotron"
 
     @property
     def effective_generator_base_url(self) -> str:
         """Return the resolved generator base URL for the configured provider."""
+        gen_prov = self.generator_provider.strip().lower()
+        if gen_prov == "nebius_token_factory":
+            if self.nebius_token_factory_base_url and self.nebius_token_factory_base_url.strip():
+                return self.nebius_token_factory_base_url.strip().rstrip("/")
+            if self.generator_base_url and self.generator_base_url.strip():
+                return self.generator_base_url.strip().rstrip("/")
+            return NEBIUS_DEFAULT_BASE_URL
         if self.generator_base_url and self.generator_base_url.strip():
             return self.generator_base_url.strip().rstrip("/")
-        if self.generator_provider == "nvidia_build":
+        if gen_prov == "nvidia_build":
             return NVIDIA_DEFAULT_BASE_URL
-        if self.generator_provider == "nebius_token_factory":
-            return NEBIUS_DEFAULT_BASE_URL
         return NVIDIA_DEFAULT_BASE_URL
 
     @model_validator(mode="after")
@@ -301,18 +341,16 @@ class Settings(BaseSettings):
                 code="invalid_provider_mode_combination",
             )
 
-        raw_key = (
+        raw_nvidia_key = (
             self.generator_api_key.get_secret_value().strip()
             if self.generator_api_key is not None
             else ""
         )
-        if not raw_key:
-            raise CompatibilityError(
-                f"ALIENESE_PROVIDER_MODE='hybrid' with GENERATOR_PROVIDER='{gen_prov}' "
-                "requires a non-empty GENERATOR_API_KEY.",
-                param="generator_api_key",
-                code="missing_provider_api_key",
-            )
+        raw_nebius_key = (
+            self.nebius_token_factory_key.get_secret_value().strip()
+            if self.nebius_token_factory_key is not None
+            else ""
+        )
 
         resolved_url = self.effective_generator_base_url
         parsed_url = urlparse(resolved_url)
@@ -320,7 +358,7 @@ class Settings(BaseSettings):
         url_host = (parsed_url.hostname or "").lower()
         if scheme != "https" or not url_host:
             raise CompatibilityError(
-                f"GENERATOR_BASE_URL for '{gen_prov}' must be a valid HTTPS URL.",
+                f"Base URL for '{gen_prov}' must be a valid HTTPS URL.",
                 param="generator_base_url",
                 code="insecure_provider_base_url",
             )
@@ -328,14 +366,30 @@ class Settings(BaseSettings):
         resolved_model = self.effective_generator_model
         if not resolved_model or resolved_model == "nvidia/nemotron":
             raise CompatibilityError(
-                f"GENERATOR_MODEL for '{gen_prov}' must be an explicit remote model ID, "
+                f"Model identifier for '{gen_prov}' must be an explicit remote model ID, "
                 "not the fake-mode placeholder 'nvidia/nemotron'.",
                 param="generator_model",
                 code="invalid_generator_model",
             )
 
         if gen_prov == "nvidia_build":
-            if not (url_host == "integrate.api.nvidia.com" or url_host.endswith(".api.nvidia.com")):
+            if not raw_nvidia_key:
+                raise CompatibilityError(
+                    "ALIENESE_PROVIDER_MODE='hybrid' with GENERATOR_PROVIDER='nvidia_build' "
+                    "requires a non-empty GENERATOR_API_KEY.",
+                    param="generator_api_key",
+                    code="missing_provider_api_key",
+                )
+            if not raw_nvidia_key.startswith("nvapi-") or (
+                raw_nebius_key and raw_nvidia_key == raw_nebius_key
+            ):
+                raise CompatibilityError(
+                    "Refusing to use a non-NVIDIA or Nebius Token Factory credential when "
+                    "GENERATOR_PROVIDER='nvidia_build'.",
+                    param="generator_api_key",
+                    code="cross_provider_credential_reuse",
+                )
+            if url_host not in ALLOWED_NVIDIA_HOSTS:
                 raise CompatibilityError(
                     f"GENERATOR_PROVIDER='nvidia_build' requires an NVIDIA API Catalog origin "
                     f"('integrate.api.nvidia.com'), got '{url_host}'.",
@@ -343,30 +397,34 @@ class Settings(BaseSettings):
                     code="provider_origin_mismatch",
                 )
         elif gen_prov == "nebius_token_factory":
-            if raw_key.startswith("nvapi-"):
+            if not raw_nebius_key:
+                if raw_nvidia_key.startswith("nvapi-"):
+                    # If caller only passed generator_api_key="nvapi-..." in nebius mode,
+                    # reject cross-provider reuse or missing NEBIUS_TOKEN_FACTORY_KEY
+                    pass
+                raise CompatibilityError(
+                    "ALIENESE_PROVIDER_MODE='hybrid' with "
+                    "GENERATOR_PROVIDER='nebius_token_factory' requires a non-empty "
+                    "NEBIUS_TOKEN_FACTORY_KEY.",
+                    param="nebius_token_factory_key",
+                    code="missing_provider_api_key",
+                )
+            if raw_nebius_key.startswith("nvapi-") or (
+                raw_nvidia_key and raw_nebius_key == raw_nvidia_key
+            ):
                 raise CompatibilityError(
                     "Refusing to reuse an NVIDIA API key ('nvapi-*') when "
                     "GENERATOR_PROVIDER='nebius_token_factory'.",
-                    param="generator_api_key",
+                    param="nebius_token_factory_key",
                     code="cross_provider_credential_reuse",
                 )
-            if not (
-                url_host == "api.tokenfactory.nebius.com"
-                or url_host.endswith(".nebius.com")
-                or url_host.endswith(".nebius.ai")
-            ):
+            if url_host not in ALLOWED_NEBIUS_HOSTS:
                 raise CompatibilityError(
-                    f"GENERATOR_PROVIDER='nebius_token_factory' requires a Nebius origin "
-                    f"('api.tokenfactory.nebius.com'), got '{url_host}'.",
-                    param="generator_base_url",
+                    "GENERATOR_PROVIDER='nebius_token_factory' requires an allowlisted Nebius "
+                    "Token Factory origin ('api.tokenfactory.us-central1.nebius.com' or "
+                    f"'api.tokenfactory.nebius.com'), got '{url_host}'.",
+                    param="nebius_token_factory_base_url",
                     code="provider_origin_mismatch",
-                )
-            if not (self.generator_model and self.generator_model.strip()):
-                raise CompatibilityError(
-                    "GENERATOR_PROVIDER='nebius_token_factory' requires an explicitly "
-                    "configured GENERATOR_MODEL.",
-                    param="generator_model",
-                    code="invalid_generator_model",
                 )
 
         return self

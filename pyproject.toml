@@ -75,6 +75,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
     "live_nvidia: Opt-in live NVIDIA API Catalog integration tests (requires RUN_LIVE_NVIDIA_TESTS=1)",
+    "live_nebius: Opt-in live Nebius Token Factory integration tests (requires RUN_LIVE_NEBIUS_TESTS=1)",
 ]
-addopts = "-ra -q --strict-markers -m 'not live_nvidia'"
+addopts = "-ra -q --strict-markers -m 'not live_nvidia and not live_nebius'"
 

@@ -57,12 +57,13 @@ def build_generator_from_settings(cfg: Settings) -> Generator:
         return FakeGenerator(model_id=cfg.effective_generator_model)
 
     gen_prov = cfg.generator_provider.strip().lower()
-    assert cfg.generator_api_key is not None
+    resolved_api_key = cfg.effective_generator_api_key
+    assert resolved_api_key is not None
 
     http_client = ProviderHttpClient(
         provider_name=gen_prov,
         base_url=cfg.effective_generator_base_url,
-        api_key=cfg.generator_api_key,
+        api_key=resolved_api_key,
         default_timeout_seconds=cfg.provider_timeout_seconds,
         retry_config=RetryConfig(
             max_attempts=cfg.provider_max_attempts,
@@ -92,6 +93,7 @@ def build_generator_from_settings(cfg: Settings) -> Generator:
             http_client=http_client,
             model_id=cfg.effective_generator_model,
             default_max_tokens=cfg.generator_max_tokens,
+            enable_thinking=cfg.generator_enable_thinking,
         )
 
     raise CompatibilityError(
