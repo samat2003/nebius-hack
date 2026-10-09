@@ -10,7 +10,7 @@ Alienese separates three responsibilities:
 
 - **Retrieval / context reduction** — EmbeddingGemma 2 reduces large context and candidate spaces into a smaller relevant working set.
 - **Decision / control** — mini-Jev, later fine-tuned as **mini-Jev-SWE**, selects the next action from a bounded set of grounded candidates.
-- **Generation / reasoning** — NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b` via NVIDIA API Catalog today; portable to Nebius Token Factory via configuration) handles open-ended reasoning and code generation when needed.
+- **Generation / reasoning** — NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b` live-verified via NVIDIA API Catalog and Nebius Token Factory) handles open-ended reasoning and code generation when needed.
 
 The runtime—not the models—owns orchestration, state reconstruction, validation, fallbacks, budgets, and observability.
 
@@ -79,7 +79,7 @@ Phase 0, Phase 1, and Phase 2 implemented:
 - **Phase 2 Provider Runtime & NVIDIA API Catalog Integration**:
   - shared remote-provider execution layer (`src/alienese/providers/runtime/`) with end-to-end turn deadlines (`RequestContext.deadline_monotonic` + `DeadlineBudget`), safe-to-retry vs. ambiguous-completion retry policy, per-attempt circuit breaker with single-probe `HALF_OPEN` admission, bounded concurrency + waiter queue admission, pre-allocation JSON byte/depth caps, streaming response byte caps, and origin-scoped HTTPS credentials (`follow_redirects=False`, `trust_env=False`);
   - live-verified `NvidiaBuildGenerator` (`nvidia/nemotron-3-super-120b-a12b` at `https://integrate.api.nvidia.com/v1`) with reasoning suppression (`enable_thinking=False`), verbatim `content` preservation, reasoning-only output rejection, and HTTP `202` pending-invocation fail-fast handling;
-  - config-switchable `NebiusTokenFactoryGenerator` (`PENDING_CREDENTIALS` / `MOCK_VERIFIED`) with full behavioral parity tests and strict credential/origin isolation;
+  - live-verified `NebiusTokenFactoryGenerator` (`LIVE_VERIFIED`, `nvidia/nemotron-3-super-120b-a12b` at verified regional endpoint `https://api.tokenfactory.us-central1.nebius.com/v1`) with reasoning suppression (`chat_template_kwargs={"enable_thinking": False}`), vLLM `message.reasoning` normalization, strict bidirectional credential isolation, and explicit origin allowlists;
   - typed `EmbeddingGemmaRetriever` (`google/embeddinggemma-300m`, Matryoshka truncation + L2 renormalization, mandatory item preservation) and `MiniJevController` (`samatv256/mini-Jev` pinned at `step-010626` / `3a1d1d19d85e9863146307fe4b769e8bbe242c4e`, single-candidate bypass, disposition preservation, simplex probability verification), both `MOCK_VERIFIED` (`BLOCKED_HOSTING`);
   - truthful nullable token and cost telemetry (`ProviderCallTelemetry` and `ChatCompletionResponse.usage`).
 
@@ -101,11 +101,18 @@ pytest
 # Optional: run bounded live NVIDIA API Catalog integration test (requires GENERATOR_API_KEY in .env)
 RUN_LIVE_NVIDIA_TESTS=1 pytest -m live_nvidia -v
 
+# Optional: run bounded live Nebius Token Factory integration test (requires NEBIUS_TOKEN_FACTORY_KEY in .env)
+RUN_LIVE_NEBIUS_TESTS=1 pytest -m live_nebius -v
+
 # Start the development server in fake-provider mode (default)
 uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
 # Start the development server in hybrid mode with NVIDIA API Catalog generator
 ALIENESE_PROVIDER_MODE=hybrid GENERATOR_PROVIDER=nvidia_build \
+  uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
+
+# Start the development server in hybrid mode with Nebius Token Factory generator
+ALIENESE_PROVIDER_MODE=hybrid GENERATOR_PROVIDER=nebius_token_factory \
   uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
@@ -115,7 +122,7 @@ ALIENESE_PROVIDER_MODE=hybrid GENERATOR_PROVIDER=nvidia_build \
 | --- | --- | --- | --- | --- |
 | `fake` (default) | `fake` | `fake` | `fake` (or ignored `.env` override) | All 3 providers run deterministically in-process (`FakeRetriever`, `FakeController`, `FakeGenerator`); zero network calls. |
 | `hybrid` | `fake` | `fake` | `nvidia_build` | `FakeRetriever` + `FakeController` + live `NvidiaBuildGenerator` (`https://integrate.api.nvidia.com/v1`). |
-| `hybrid` | `fake` | `fake` | `nebius_token_factory` | `FakeRetriever` + `FakeController` + `NebiusTokenFactoryGenerator` (`https://api.tokenfactory.nebius.com/v1`; requires Nebius credentials & explicit `GENERATOR_MODEL`). |
+| `hybrid` | `fake` | `fake` | `nebius_token_factory` | `FakeRetriever` + `FakeController` + live-verified `NebiusTokenFactoryGenerator` (`https://api.tokenfactory.us-central1.nebius.com/v1`; requires `NEBIUS_TOKEN_FACTORY_KEY`; defaults to `nvidia/nemotron-3-super-120b-a12b`). |
 | `remote` | Any | Any | Any | Rejected with `CompatibilityError` (`unsupported_provider_mode`) until `mini-Jev` and `EmbeddingGemma 2` hosting are enabled. |
 
 See [docs/providers/compatibility-matrix.md](docs/providers/compatibility-matrix.md) and [docs/adr/0002-remote-provider-runtime-and-telemetry.md](docs/adr/0002-remote-provider-runtime-and-telemetry.md).
