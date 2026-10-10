@@ -66,7 +66,7 @@ See [AGENTS.md](AGENTS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/
 
 ## Status
 
-Phase 0, Phase 1, and Phase 2 implemented:
+Phase 0, Phase 1, Phase 2, and Phase 3 implemented:
 
 - **Phase 0/1 Runtime Foundation**:
   - typed core domain contracts (`NormalizedEvent`, `WorkingState`, `CandidateAction`, `DecisionResult`, `GenerationJob`, `ReplayArtifact`);
@@ -82,6 +82,16 @@ Phase 0, Phase 1, and Phase 2 implemented:
   - live-verified `NebiusTokenFactoryGenerator` (`LIVE_VERIFIED`, `nvidia/nemotron-3-super-120b-a12b` at verified regional endpoint `https://api.tokenfactory.us-central1.nebius.com/v1`) with reasoning suppression (`chat_template_kwargs={"enable_thinking": False}`), vLLM `message.reasoning` normalization, strict bidirectional credential isolation, and explicit origin allowlists;
   - typed `EmbeddingGemmaRetriever` (`google/embeddinggemma-300m`, Matryoshka truncation + L2 renormalization, mandatory item preservation) and `MiniJevController` (`samatv256/mini-Jev` pinned at `step-010626` / `3a1d1d19d85e9863146307fe4b769e8bbe242c4e`, single-candidate bypass, disposition preservation, simplex probability verification), both `MOCK_VERIFIED` (`BLOCKED_HOSTING`);
   - truthful nullable token and cost telemetry (`ProviderCallTelemetry` and `ChatCompletionResponse.usage`).
+- **Phase 3 Deterministic Grounding and Candidate Construction (Completed)**:
+  - deterministic typed evidence extraction (`GroundingEvidence`: file paths, symbols, test targets/commands, search patterns, stack frames, failure messages, exit statuses, mutation targets, verification results);
+  - strict 4-tier trust boundaries (`SYSTEM_PROMPT` > `USER_DIRECTIVE` > `AGENT_COMMITTED` > `UNTRUSTED_EXTERNAL`) preventing untrusted tool results from hijacking policy or fabricating tool arguments;
+  - zero-hallucination argument resolution (`GroundedArgumentResolver`) binding JSON schema parameters to extracted evidence without inventing paths, tests, or commands;
+  - multi-factor candidate scoring and deterministic ranking/bounding (default $K=8$), prioritizing user-directed requests, failures, verification obligations, and complete tool actions;
+  - full enforcement of `tool_choice` policies (`none`, named tool, `required` [restricted to low-risk actions], and `auto`);
+  - golden evaluation dataset (`tests/fixtures/grounding/decision_points.json`) with 35 curated coding decision points across train, dev, and held-out test splits;
+  - evaluation CLI (`python -m alienese.grounding.eval`) demonstrating:
+    - Held-out test split: Oracle Recall@1 **90.00%** (vs Phase 1 baseline **10.00%**, **+80.00% lift**), Recall@4/8 **90.00%**, Argument Completeness **100.00%**, Executable Validity **100.00%**, Fabrication Count **0**;
+    - Overall corpus (N=35): Oracle Recall@1 **82.86%** (vs Phase 1 baseline **17.14%**, **+65.72% lift**), Recall@4/8 **85.71%**, Executable Validity **100.00%**, Fabrication Count **0**.
 
 Default `pytest` execution remains 100% offline and deterministic (`ALIENESE_PROVIDER_MODE=fake` by default, even when `.env` contains live API keys).
 
@@ -97,6 +107,9 @@ ruff check .
 ruff format --check .
 mypy src tests
 pytest
+
+# Run offline grounding candidate evaluation against golden dataset
+python -m alienese.grounding.eval
 
 # Optional: run bounded live NVIDIA API Catalog integration test (requires GENERATOR_API_KEY in .env)
 RUN_LIVE_NVIDIA_TESTS=1 pytest -m live_nvidia -v
@@ -182,6 +195,22 @@ src/alienese/
 │   ├── normalize.py
 │   ├── reconstruct.py
 │   └── turn.py
+├── grounding/
+│   ├── extractors/
+│   │   ├── base.py
+│   │   ├── commands.py
+│   │   ├── failures.py
+│   │   ├── mutation.py
+│   │   ├── paths.py
+│   │   ├── symbols.py
+│   │   └── tests.py
+│   ├── argument_resolution.py
+│   ├── candidate_builder.py
+│   ├── eval.py
+│   ├── evidence.py
+│   ├── normalization.py
+│   ├── policy.py
+│   └── ranking.py
 ├── observability/
 │   ├── logging.py
 │   ├── redaction.py

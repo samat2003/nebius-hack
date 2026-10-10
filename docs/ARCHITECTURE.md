@@ -166,37 +166,44 @@ A narrow synthesis request with a typed purpose, for example:
 
 A GenerationJob contains only the context needed for that job.
 
-## 6. Grounding
+## 6. Grounding and Candidate Construction
 
-Grounding converts observed evidence into concrete action possibilities.
+Grounding converts observed evidence from normalized events and `WorkingState` into concrete, executable `CandidateAction` possibilities without inventing tool arguments.
 
-Evidence sources include:
+### Evidence Taxonomy (`GroundingEvidence`)
+The engine extracts typed immutable evidence across 10 categories:
+1. `FILE_PATH` — normalized repo paths from user prompts, tool arguments, tracebacks, or directory listings.
+2. `SYMBOL` — classes, functions, and variables from code blocks, syntax errors, or stack frames.
+3. `TEST_TARGET` — pytest node IDs (e.g. `tests/test_auth.py::test_login`), class/method targets, and unittest specifications.
+4. `TEST_COMMAND` — exact observed test commands and safe verification invocations.
+5. `SEARCH_PATTERN` — symbol or regex search queries derived from user questions or error diagnostics.
+6. `STACK_FRAME` — structured file, line number, and function scopes extracted from exception tracebacks.
+7. `FAILURE_MESSAGE` — top-level exception messages, assertion failures, and syntax error headers.
+8. `EXIT_STATUS` — non-zero return codes from tool execution.
+9. `MUTATION_TARGET` — files attempted or modified by edit/write tools.
+10. `VERIFICATION_RESULT` — test execution outcomes confirming or refuting pending mutations.
 
-1. exact/direct references;
-2. stack traces and failures;
-3. structural/lexical matches;
-4. recently modified or observed entities;
-5. semantic relevance.
+### 4-Tier Trust Hierarchy
+Evidence is assigned a strict trust rank:
+`SYSTEM_PROMPT` (4) > `USER_DIRECTIVE` (3) > `AGENT_COMMITTED` (2) > `UNTRUSTED_EXTERNAL` (1)
+- Content from tool outputs (`TOOL_RESULT`) remains `UNTRUSTED_EXTERNAL` and cannot override system policy or inject untrusted instructions.
+- Conflicting evidence resolves deterministically in favor of higher trust level, followed by verification status, then most recent sequence number.
 
-Direct evidence outranks embedding similarity.
+### Zero-Fabrication Argument Resolution
+`GroundedArgumentResolver` maps tool schemas to extracted evidence parameters without hallucinating values:
+- File paths are validated against repo bounds and path normalization rules.
+- Test commands are bound to known test targets or exact previous commands.
+- If a required parameter cannot be bound from evidence or schema defaults, the candidate is marked non-complete (`arguments_complete=False`) and excluded from executable emission.
 
-The system should prefer:
+### Multi-Factor Ranking and Bounding
+Candidates are scored deterministically based on:
+- Explicit user directives (+300.0);
+- Failure remediation and stack trace targets (+250.0);
+- Unverified mutation obligations (+200.0);
+- Complete executable tool actions (+200.0) vs. assistant text answer (+100.0);
+- Trust tier and recency bonuses.
 
-```text
-READ src/auth/session.py
-RUN pytest tests/test_session.py
-SEARCH invalidate_session
-```
-
-over:
-
-```text
-READ
-TEST
-SEARCH
-```
-
-when arguments can be grounded from known state.
+The candidate set is bounded to $K=8$ (configurable), ensuring the downstream controller receives a compact, high-recall action space.
 
 ## 7. Candidate policy
 

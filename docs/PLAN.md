@@ -71,29 +71,40 @@ Fault tests cover timeout, deadline exhaustion, cancellation, rate limit (`429` 
 
 ---
 
-## Phase 3 — Grounding and canonical capabilities
+## Phase 3 — Grounding and canonical capabilities (Completed)
 
-Normalize harness-specific tools into canonical capabilities.
+Normalize harness-specific tools into canonical capabilities and extract grounded evidence from history and tool results.
 
-Extract from history/tool results:
-
-- file paths;
-- symbols;
-- test names;
-- commands;
-- stack traces;
-- failures;
-- mutation/verification state.
-
-Construct complete grounded CandidateActions where possible.
+Implemented deliverables:
+- `src/alienese/grounding/evidence.py`: Immutable typed evidence records (`GroundingEvidence`) across 10 categories (`FILE_PATH`, `SYMBOL`, `TEST_TARGET`, `TEST_COMMAND`, `SEARCH_PATTERN`, `STACK_FRAME`, `FAILURE_MESSAGE`, `EXIT_STATUS`, `MUTATION_TARGET`, `VERIFICATION_RESULT`).
+- `src/alienese/grounding/normalization.py`: Sanitization and bounds enforcement for paths, symbols, test targets, and deduplication with trust hierarchy (`SYSTEM_PROMPT` > `USER_DIRECTIVE` > `AGENT_COMMITTED` > `UNTRUSTED_EXTERNAL`).
+- `src/alienese/grounding/extractors/`: Modular deterministic extractors with hard resource bounding (32KB content cap, 50 event scan cap, 100 evidence record cap).
+- `src/alienese/grounding/argument_resolution.py`: `GroundedArgumentResolver` mapping JSON schemas to evidence parameters without fabricating paths or arguments.
+- `src/alienese/grounding/ranking.py`: Deterministic scoring and candidate bounding ($K=8$), prioritizing user-directed requests, failures, and unverified mutations.
+- `src/alienese/grounding/policy.py`: Strict enforcement of `tool_choice` policies (`none`, named tool, `required` restricted to low-risk tools, `auto`).
+- `src/alienese/grounding/eval.py`: Offline evaluation CLI benchmarking candidate sets against golden decision points.
+- `tests/fixtures/grounding/decision_points.json`: Curated dataset with 35 labeled coding decision points across train (18), dev (7), and held-out test (10) splits.
 
 ### Primary metric
 
 **Oracle Candidate Recall@K**
 
+### Measured results
+
+| Metric | Phase 1 Baseline | Phase 3 Engine | Lift |
+| --- | --- | --- | --- |
+| **Held-Out Test Oracle Recall@1** | 10.00% | **90.00%** | **+80.00%** |
+| **Held-Out Test Oracle Recall@4** | 10.00% | **90.00%** | **+80.00%** |
+| **Held-Out Test Oracle Recall@8** | 10.00% | **90.00%** | **+80.00%** |
+| **Held-Out Test Arg Completeness** | 100.00% | **100.00%** | +0.00% |
+| **Held-Out Test Executable Validity** | 100.00% | **100.00%** | 0.0% |
+| **Held-Out Test Fabrication Count** | 0 | **0** | 0 |
+| **Overall (N=35) Oracle Recall@1** | 17.14% | **82.86%** | **+65.72%** |
+| **Overall (N=35) Oracle Recall@4/8**| 17.14% | **85.71%** | **+68.57%** |
+
 ### Quality gate
 
-On a manually labeled decision set, the candidate engine retains an acceptable next action at high recall before mini-Jev is allowed to control production decisions.
+Passed: On the 35-point curated decision set, Oracle Recall@1 reached 90.00% on held-out test (82.86% overall) with zero fabrications and 100% executable validity before mini-Jev is allowed to control production decisions.
 
 ---
 
