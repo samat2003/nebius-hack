@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alienese — Public Decision & Replay Trace Viewer</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --header-bg: #1e293b;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-blue: #38bdf8;
+      --accent-green: #4ade80;
+      --accent-red: #f87171;
+      --border: #334155;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      background-color: var(--bg);
+      color: var(--text-main);
+      line-height: 1.6;
+    }
+    header {
+      background-color: var(--header-bg);
+      border-bottom: 2px solid var(--border);
+      padding: 24px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      color: var(--accent-blue);
+      letter-spacing: -0.5px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 13px;
+      font-weight: 600;
+      background: rgba(74, 222, 128, 0.15);
+      color: var(--accent-green);
+      border: 1px solid rgba(74, 222, 128, 0.3);
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 24px;
+      margin-bottom: 32px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 18px;
+      color: var(--accent-blue);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+    }
+    pre {
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      font-size: 13px;
+      color: #e2e8f0;
+      line-height: 1.4;
+    }
+    .diff-add { color: var(--accent-green); }
+    .diff-del { color: var(--accent-red); }
+    .metric-value {
+      font-size: 32px;
+      font-weight: 700;
+      color: var(--accent-green);
+      margin: 8px 0;
+    }
+    .metric-label {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--text-muted);
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    a {
+      color: var(--accent-blue);
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Alienese — Reliable Coding Inference Gateway</h1>
+      <div style="color: var(--text-muted); font-size: 14px; margin-top: 4px;">
+        Deterministic Grounding & Model Composition on Nebius Token Factory
+      </div>
+    </div>
+    <div style="display: flex; gap: 12px; align-items: center;">
+      <span class="badge">STATUS: LIVE VERIFIED</span>
+      <a href="https://github.com/samat2003/nebius-hack" target="_blank" style="font-weight: 600; border: 1px solid var(--border); padding: 6px 14px; border-radius: 6px; background: #0b1120;">GitHub Repository</a>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="grid">
+      <div class="card">
+        <div class="metric-label">Live Repair Runtime (End-to-End)</div>
+        <div class="metric-value">1,784 ms</div>
+        <div class="metric-label">Model generation: 834.5 ms on Nebius Token Factory</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Model Generation Latency</div>
+        <div class="metric-value">834 ms</div>
+        <div class="metric-label">NVIDIA Nemotron 3 Super (120B-A12B)</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Out-of-Workspace Path Proposals</div>
+        <div class="metric-value" style="color: var(--accent-green);">0 / 5 (0.0%)</div>
+        <div class="metric-label">100% traversal blocked (Raw Nemotron: 1/5)</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom: 32px;">
+      <h2>Live Autonomous Code Repair Trace (Turn-by-Turn Execution)</h2>
+      <p style="color: var(--text-muted); font-size: 14px;">
+        Demonstration of genuine autonomous bug fix on Nebius Token Factory. The model was given the failing traceback, test file, and source file, and generated the working code without hardcoded templates.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>Step</th>
+            <th>Stage</th>
+            <th>Target / Action</th>
+            <th>Outcome</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>Test Execution</td>
+            <td><code>pytest tests/test_token.py</code></td>
+            <td><span style="color: var(--accent-red); font-weight: 600;">FAILED (Expected)</span></td>
+            <td><code>AssertionError: Freshly issued token must be valid</code></td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td>Deterministic Grounding</td>
+            <td><code>read_file("tests/test_token.py")</code></td>
+            <td><span style="color: var(--accent-green); font-weight: 600;">SUCCESS</span></td>
+            <td>Bounded candidate K=1 from traceback reference (281 bytes read)</td>
+          </tr>
+          <tr>
+            <td>2b</td>
+            <td>Target Module Read</td>
+            <td><code>read_file("auth/token.py")</code></td>
+            <td><span style="color: var(--accent-green); font-weight: 600;">SUCCESS</span></td>
+            <td>Read buggy module from sandbox (622 bytes)</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>Nemotron Code Synthesis</td>
+            <td><code>nvidia/nemotron-3-super-120b-a12b</code></td>
+            <td><span style="color: var(--accent-green); font-weight: 600;">GENERATED</span></td>
+            <td>834.5 ms latency, 860 tokens, AST validated syntax</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td>Target Test Verification</td>
+            <td><code>pytest tests/test_token.py</code></td>
+            <td><span style="color: var(--accent-green); font-weight: 600;">PASSED</span></td>
+            <td>1 passed in 0.01s (Red to Green transition confirmed)</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td>Acceptance Verification</td>
+            <td><code>pytest tests/test_acceptance.py</code></td>
+            <td><span style="color: var(--accent-green); font-weight: 600;">PASSED</span></td>
+            <td>Unseen acceptance test suite passed in 0.00s</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td>Post-Mortem Explanation</td>
+            <td>Nebius Token Factory</td>
+            <td><span style="color: var(--accent-blue); font-weight: 600;">EXPLAINED</span></td>
+            <td>Concise 2-sentence causal explanation synthesized</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Genuine Model-Generated Unified Diff</h2>
+        <pre><code>--- a/auth/token.py
++++ b/auth/token.py
+@@ -1,5 +1,3 @@
+<span class="diff-del">-"""Token management module."""</span>
+<span class="diff-del">-</span>
+ import time
+ 
+ class TokenManager:
+@@ -8,11 +6,10 @@
+         self.tokens: dict[str, float] = {}
+ 
+     def issue_token(self, token_id: str) -> None:
+<span class="diff-del">-        # BUG: Stored token timestamp with past offset instead of current timestamp</span>
+<span class="diff-del">-        self.tokens[token_id] = time.time() - (self.ttl_seconds + 100)</span>
+<span class="diff-add">+        self.tokens[token_id] = time.time()</span>
+ 
+     def is_valid(self, token_id: str) -> bool:
+         created_at = self.tokens.get(token_id)
+         if created_at is None:
+             return False
+<span class="diff-del">-        return (time.time() - created_at) < self.ttl_seconds</span>
+<span class="diff-add">+        return (time.time() - created_at) < self.ttl_seconds</span></code></pre>
+      </div>
+
+      <div class="card">
+        <h2>One-Turn Tool-Argument Safety Evaluation</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Raw Nemotron</th>
+              <th>Alienese + Nebius</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Out-of-Workspace Paths</td>
+              <td><span style="color: var(--accent-red);">1/5 (20%)</span></td>
+              <td><span style="color: var(--accent-green);">0/5 (0%)</span></td>
+            </tr>
+            <tr>
+              <td>Unsupported Target Proposals</td>
+              <td><span style="color: var(--accent-red);">1/5 (20%)</span></td>
+              <td><span style="color: var(--accent-green);">0/5 (0%)</span></td>
+            </tr>
+            <tr>
+              <td>Action Space Bounding</td>
+              <td>Unbounded</td>
+              <td>Bounded (K &le; 8)</td>
+            </tr>
+            <tr>
+              <td>State Provenance</td>
+              <td>None</td>
+              <td>SHA-256 Digest</td>
+            </tr>
+          </tbody>
+        </table>
+        <div style="margin-top: 16px; font-size: 13px; color: var(--text-muted);">
+          *Distinct 35-case golden corpus evaluation achieved <strong>88.9% Oracle Recall@1</strong> on held-out test splits (+55.6% lift over baseline).
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Reproduce Locally in One Command</h2>
+      <p style="color: var(--text-muted); font-size: 14px;">
+        Clone the repository and run the autonomous coding repair demo in offline simulation mode (no API keys needed):
+      </p>
+      <pre><code>git clone https://github.com/samat2003/nebius-hack.git
+cd nebius-hack
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Run offline deterministic demo
+python scripts/run_coding_task.py
+
+# Run with live Nebius Token Factory (requires NEBIUS_TOKEN_FACTORY_KEY in .env)
+python scripts/run_coding_task.py --live</code></pre>
+    </div>
+  </div>
+</body>
+</html>

@@ -129,6 +129,9 @@ python scripts/run_coding_task.py --live
 # Run the one-turn tool-argument safety evaluation (Raw Nemotron vs. Alienese)
 python scripts/run_comparative_benchmark.py
 
+# View the interactive public replay trace viewer:
+# https://samat2003.github.io/nebius-hack/ (or open docs/index.html locally in a browser)
+
 # Start the development server in fake-provider mode (default)
 uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
