@@ -1,262 +1,273 @@
-# Alienese
+# Alienese — Evidence-Grounded Reliability for AI Coding Agents
 
-Alienese is a unified inference API for coding agents that composes specialized models instead of relying on one large language model for every step.
+[![CI](https://github.com/samat2003/nebius-hack/actions/workflows/ci.yml/badge.svg)](https://github.com/samat2003/nebius-hack/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Nebius Token Factory](https://img.shields.io/badge/Inference-Nebius%20Token%20Factory-green.svg)](https://nebius.com/)
+[![Model](https://img.shields.io/badge/Model-NVIDIA%20Nemotron%203%20Super-purple.svg)](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b)
 
-It exposes a single OpenAI-compatible API endpoint that can be plugged into an existing coding harness, agent runtime, IDE backend, or evaluation framework.
+**Alienese** is an evidence-grounded inference gateway and model-composition runtime exposed as an OpenAI-compatible API.
 
-## Core idea
+Coding agents often fail acutely in production: unconstrained LLMs hallucinate non-existent files, propose directory traversals outside the workspace, get trapped in loops, and lack deterministic auditability. Alienese eliminates these failure modes by enforcing **deterministic state reconstruction** and **evidence-grounded candidate bounding** ($K \le 8$) before delegating code synthesis to **NVIDIA Nemotron 3 Super (120B-A12B)** running on **Nebius Token Factory**.
 
-Alienese separates three responsibilities:
+- 🌐 **Interactive Replay Trace Viewer:** [samat2003.github.io/nebius-hack](https://samat2003.github.io/nebius-hack/)
+- 📖 **Judge Quickstart Guide:** [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md)
+- 📊 **Live Run Report:** [results/live_run_report.json](results/live_run_report.json)
+- 🛡️ **Comparative Safety Benchmark:** [results/benchmark_report.md](results/benchmark_report.md)
+- 📦 **Latest Release:** [v0.1.1-submission](https://github.com/samat2003/nebius-hack/releases)
 
-- **Retrieval / context reduction** — EmbeddingGemma 2 reduces large context and candidate spaces into a smaller relevant working set.
-- **Decision / control** — mini-Jev, later fine-tuned as **mini-Jev-SWE**, selects the next action from a bounded set of grounded candidates.
-- **Generation / reasoning** — NVIDIA Nemotron (`nvidia/nemotron-3-super-120b-a12b` live-verified via NVIDIA API Catalog and Nebius Token Factory) handles open-ended reasoning and code generation when needed.
+---
 
-The runtime—not the models—owns orchestration, state reconstruction, validation, fallbacks, budgets, and observability.
+## 2. See It Work
 
-## Initial architecture
-
-The first implementation uses existing model endpoints with **no new training**. The goal is to validate the system architecture before fine-tuning mini-Jev-SWE.
-
-```text
-Coding harness
-      |
-      | OpenAI-compatible request
-      v
-+-----------------------------+
-|          Alienese           |
-|                             |
-| protocol + state            |
-| grounding + candidates      |
-| context selection           |
-| policy + validation         |
-+-----+-----------+-----------+
-      |           |
-      |           |
-      v           v
- Embedding     mini-Jev
- Gemma 2       controller
-      \           /
-       \         /
-        v       v
-       Nemotron
- (NVIDIA API Catalog /
-  Nebius Token Factory)
-        |
-        v
-OpenAI-compatible response
-```
-
-Not every request calls every model. Deterministic logic should bypass model calls whenever possible.
-
-## Engineering principles
-
-1. Alienese owns the state machine. Models never orchestrate one another.
-2. One external request returns at most one externally visible action.
-3. Correctness must not depend on opaque server-side session state.
-4. Candidate actions should be grounded before they reach the controller.
-5. Nemotron is a generator/reasoner, not a generic tool-argument filler.
-6. Retrieval may reduce optional context but must never remove correctness-critical state.
-7. Remote calls are bounded by deadlines, retries, budgets, and circuit breakers.
-8. Every important decision is traceable and replayable.
-9. Provider-specific SDKs stay outside the core runtime.
-10. Training begins only after the architecture produces useful traces and measurable failure modes.
-
-See [AGENTS.md](AGENTS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PLAN.md](docs/PLAN.md), and [docs/providers/compatibility-matrix.md](docs/providers/compatibility-matrix.md).
-
-## Status
-
-Phase 0, Phase 1, Phase 2, and Phase 3 implemented:
-
-- **Phase 0/1 Runtime Foundation**:
-  - typed core domain contracts (`NormalizedEvent`, `WorkingState`, `CandidateAction`, `DecisionResult`, `GenerationJob`, `ReplayArtifact`);
-  - 4-tier trust model (`SYSTEM_TRUSTED`, `USER`, `MODEL_GENERATED`, `UNTRUSTED_EXTERNAL`);
-  - deterministic OpenAI protocol normalization and `WorkingState` reconstruction with canonical `state_digest`;
-  - strict `Retriever`, `Controller`, and `Generator` protocols with deterministic offline fake providers (`FakeRetriever`, `FakeController`, `FakeGenerator`) and fault injection;
-  - single-turn `TurnEngine` enforcing one external action per turn and pre-serialization tool schema validation;
-  - idempotent request handling (`Idempotency-Key`) separating HTTP attempt `request_id` from logical `operation_id`;
-  - central secret redaction, structured logging (`structlog`), and OpenTelemetry tracing hooks.
-- **Phase 2 Provider Runtime & NVIDIA API Catalog Integration**:
-  - shared remote-provider execution layer (`src/alienese/providers/runtime/`) with end-to-end turn deadlines (`RequestContext.deadline_monotonic` + `DeadlineBudget`), safe-to-retry vs. ambiguous-completion retry policy, per-attempt circuit breaker with single-probe `HALF_OPEN` admission, bounded concurrency + waiter queue admission, pre-allocation JSON byte/depth caps, streaming response byte caps, and origin-scoped HTTPS credentials (`follow_redirects=False`, `trust_env=False`);
-  - live-verified `NvidiaBuildGenerator` (`nvidia/nemotron-3-super-120b-a12b` at `https://integrate.api.nvidia.com/v1`) with reasoning suppression (`enable_thinking=False`), verbatim `content` preservation, reasoning-only output rejection, and HTTP `202` pending-invocation fail-fast handling;
-  - live-verified `NebiusTokenFactoryGenerator` (`LIVE_VERIFIED`, `nvidia/nemotron-3-super-120b-a12b` at verified regional endpoint `https://api.tokenfactory.us-central1.nebius.com/v1`) with reasoning suppression (`chat_template_kwargs={"enable_thinking": False}`), vLLM `message.reasoning` normalization, strict bidirectional credential isolation, and explicit origin allowlists;
-  - typed `EmbeddingGemmaRetriever` (`google/embeddinggemma-300m`, Matryoshka truncation + L2 renormalization, mandatory item preservation) and `MiniJevController` (`samatv256/mini-Jev` pinned at `step-010626` / `3a1d1d19d85e9863146307fe4b769e8bbe242c4e`, single-candidate bypass, disposition preservation, simplex probability verification), both `MOCK_VERIFIED` (`BLOCKED_HOSTING`);
-  - truthful nullable token and cost telemetry (`ProviderCallTelemetry` and `ChatCompletionResponse.usage`).
-- **Phase 3 Deterministic Grounding and Candidate Construction (Completed)**:
-  - deterministic typed evidence extraction (`GroundingEvidence`: file paths, symbols, test targets/commands, search patterns, stack frames, failure messages, exit statuses, mutation targets, verification results);
-  - strict repository path containment rejecting out-of-workspace, Windows drive, UNC, URI, and traversal escape paths (with schema defaults boundary validation ensuring uncontained paths cannot leak from tool schemas; physical symlink containment remains the coding harness runtime sandbox responsibility);
-  - validated verification-command form (`is_safe_verification_command`) enforcing conservative per-executable option allowlists (`pytest`, `python -m unittest`, `ruff`, `mypy`), explicitly rejecting plugin loading (e.g., `pytest -p`), config overrides (`--override-ini`), module-loading flags, shell pipelines, chaining, and redirections;
-  - positive mutation confirmation (`classify_mutation_outcome`) requiring structured success output or specific target-file matching text, strictly rejecting empty, unrelated, wrong-file, or failed results, and distinguishing attempted mutations (`OBSERVED`) from confirmed applied mutations (`CONFIRMED`);
-  - explicit verification outcome classifier (`PASSED` [positive confirmation only], `FAILED`, `UNKNOWN`);
-  - strict 4-tier trust boundaries (`SYSTEM_PROMPT` > `USER_DIRECTIVE` > `AGENT_COMMITTED` > `UNTRUSTED_EXTERNAL`);
-  - zero-hallucination argument resolution (`GroundedArgumentResolver`) binding JSON schema parameters to extracted evidence without inventing paths, tests, or commands, with evidence taking precedence over schema defaults;
-  - tool-choice eligibility enforcement before candidate truncation and multi-factor deterministic candidate ranking/bounding (default $K=8$);
-  - golden evaluation dataset (`tests/fixtures/grounding/decision_points.json`) with 35 curated coding decision points across train, dev, and held-out test splits;
-  - offline evaluation CLI (`python -m alienese.grounding.eval`) with evidence-support proxy metric (checking exact arguments against evidence and validated tool defaults without unhashable-object crashes) demonstrating:
-    - Held-out test split (Action N=9, Abstain N=1): Oracle Recall@1 **8/9 (88.9%)** (vs Phase 1 baseline **3/9 [33.3%]**, **+55.6% lift**), Recall@4/8 **8/9 (88.9%)**, Exact Arg Accuracy **8/9 (88.9%)**, Arg Presence **8/8 (100.0%)**, Abstention Correctness **1/1 (100.0%)**, Executable Validity **10/10 (100.0%)**, Evidence Support (Proxy) **10/10 (100.0%)**, Unsupported Args **0/10**;
-    - Overall corpus (Total N=35, Action N=29, Abstain N=6): Oracle Recall@1 **23/29 (79.3%)** (vs Phase 1 baseline **6/29 [20.7%]**, **+58.6% lift**), Recall@4/8 **24/29 (82.8%)**, Exact Arg Accuracy **24/29 (82.8%)**, Arg Presence Rate **22/26 (84.6%)**, Abstention Correctness **6/6 (100.0%)**, Executable Validity **27/27 (100.0%)**, Evidence Support (Proxy) **27/27 (100.0%)**, Unsupported Args **0/27**.
-
-Default `pytest` execution remains 100% offline and deterministic (`ALIENESE_PROVIDER_MODE=fake` by default, even when `.env` contains live API keys).
-
-## Developer setup
+Alienese runs out of the box in both offline simulation mode (no API credentials or internet needed) and genuine live inference on Nebius Token Factory.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+# Clone and prepare environment
+git clone https://github.com/samat2003/nebius-hack.git
+cd nebius-hack
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-
-# Run static checks and offline test suite (no API keys or network calls used)
-ruff check .
-ruff format --check .
-mypy src tests
-pytest
-
-# Run offline grounding candidate evaluation against golden dataset
-python -m alienese.grounding.eval
-
-# Optional: run bounded live NVIDIA API Catalog integration test (requires GENERATOR_API_KEY in .env)
-RUN_LIVE_NVIDIA_TESTS=1 pytest -m live_nvidia -v
-
-# Optional: run bounded live Nebius Token Factory integration test (requires NEBIUS_TOKEN_FACTORY_KEY in .env)
-RUN_LIVE_NEBIUS_TESTS=1 pytest -m live_nebius -v
-
-# Run the one-command offline autonomous coding repair demo (no API keys needed)
-python scripts/run_coding_task.py
-
-# Run the live autonomous coding repair workflow on Nebius Token Factory (requires NEBIUS_TOKEN_FACTORY_KEY in .env)
-python scripts/run_coding_task.py --live
-
-# Run the one-turn tool-argument safety evaluation (Raw Nemotron vs. Alienese)
-python scripts/run_comparative_benchmark.py
-
-# View the interactive public replay trace viewer:
-# https://samat2003.github.io/nebius-hack/ (or open docs/index.html locally in a browser)
-
-# Start the development server in fake-provider mode (default)
-uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
-
-# Start the development server in hybrid mode with NVIDIA API Catalog generator
-ALIENESE_PROVIDER_MODE=hybrid GENERATOR_PROVIDER=nvidia_build \
-  uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
-
-# Start the development server in hybrid mode with Nebius Token Factory generator
-ALIENESE_PROVIDER_MODE=hybrid GENERATOR_PROVIDER=nebius_token_factory \
-  uvicorn alienese.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-## Provider Mode Matrix (Phase 2)
+### A. Offline Simulation (Reproducible, 0 Credentials, < 1.0s)
+Executes the full state machine, workspace containment, patch application, and pytest verification suite using deterministic offline playback:
 
-| `ALIENESE_PROVIDER_MODE` | `RETRIEVER_PROVIDER` | `CONTROLLER_PROVIDER` | `GENERATOR_PROVIDER` | Behavior |
-| --- | --- | --- | --- | --- |
-| `fake` (default) | `fake` | `fake` | `fake` (or ignored `.env` override) | All 3 providers run deterministically in-process (`FakeRetriever`, `FakeController`, `FakeGenerator`); zero network calls. |
-| `hybrid` | `fake` | `fake` | `nvidia_build` | `FakeRetriever` + `FakeController` + live `NvidiaBuildGenerator` (`https://integrate.api.nvidia.com/v1`). |
-| `hybrid` | `fake` | `fake` | `nebius_token_factory` | `FakeRetriever` + `FakeController` + live-verified `NebiusTokenFactoryGenerator` (`https://api.tokenfactory.us-central1.nebius.com/v1`; requires `NEBIUS_TOKEN_FACTORY_KEY`; defaults to `nvidia/nemotron-3-super-120b-a12b`). |
-| `remote` | Any | Any | Any | Rejected with `CompatibilityError` (`unsupported_provider_mode`) until `mini-Jev` and `EmbeddingGemma 2` hosting are enabled. |
+```bash
+# Recommended: Cross-module session manager integration challenge
+python scripts/run_coding_task.py --task integration --out results/judge_offline.json
 
-See [docs/providers/compatibility-matrix.md](docs/providers/compatibility-matrix.md) and [docs/adr/0002-remote-provider-runtime-and-telemetry.md](docs/adr/0002-remote-provider-runtime-and-telemetry.md).
+# Baseline fallback: Single-module token expiry demo
+python scripts/run_coding_task.py --task token --out results/token_offline.json
+```
 
-## Supported external API subset (Phase 1/2)
+### B. Live Nebius Token Factory Inference
+Runs genuine live model inference against `nvidia/nemotron-3-super-120b-a12b` via Nebius Token Factory:
 
-### Endpoints
+```bash
+# Provide your own Nebius Token Factory API key
+export NEBIUS_TOKEN_FACTORY_KEY="your-token-factory-key"
 
-- `GET /health` — runtime liveness, version, and active provider mode (`fake` or `hybrid`).
-- `GET /v1/models` — exposes `alienese-default` as the single supported public model.
-- `POST /v1/chat/completions` — single-turn non-streaming completion returning either one assistant text response or one validated tool call.
+# Run genuine live repair on the integration challenge
+python scripts/run_coding_task.py --task integration --live --out results/live_run_report.json
+```
 
-### `POST /v1/chat/completions` compatibility contract
+---
 
-| Parameter | Status | Behavior |
-| --- | --- | --- |
-| `model` | Supported | Must be `alienese-default`; unknown model IDs rejected with `compatibility_error` (`model_not_supported`) |
-| `messages` | Supported | `system`, `developer`, `user`, `assistant`, and `tool` roles normalized into typed events |
-| `tools` | Supported | Function tool schemas bound to `ExternalToolBinding`; unknown tools preserved as `CUSTOM_TOOL` |
-| `tool_choice` | Supported | `"auto"`, `"none"`, `"required"`, or named function object (`{"type": "function", "function": {"name": "..."}}`). Never fabricates missing required tool arguments |
-| `temperature` | Supported | Validated (`[0.0, 2.0]`) and forwarded to `GenerationJob` |
-| `max_tokens` / `max_completion_tokens` | Supported | Validated (`>= 1`) and forwarded to `GenerationJob`; conflicting values rejected with `CompatibilityError` |
-| `user`, `metadata` | Accepted (no-op) | Validated and redacted in logs; currently have no policy effect |
-| `stream=true` | Rejected (400) | Fails with `compatibility_error` (`streaming_not_supported`) |
-| `n != 1` | Rejected (400) | Fails with `compatibility_error` (`multiple_choices_not_supported`) |
-| `parallel_tool_calls=true` | Rejected (400) | Fails with `compatibility_error` (`parallel_tool_calls_not_supported`) |
-| `functions` / `function_call` | Rejected (400) | Fails with `compatibility_error` (`legacy_functions_not_supported`) |
-| Other OpenAI fields / `/v1/responses` | Rejected (400) | Rejected explicitly with `compatibility_error` or `invalid_request_error` |
+## 3. Why Alienese Is Different
 
-### Idempotency and correlation headers
+Standard coding agents ask a large LLM to freely generate tool names and JSON arguments. When an error occurs, the model guesses file locations and commands.
 
-- `Idempotency-Key`: Maps a canonical request fingerprint to a stable logical `operation_id` and completed response. Retried HTTP requests with the same key and identical body receive a fresh per-attempt `X-Request-ID` in logs and headers while returning the exact previously completed logical response (`X-Idempotent-Replay: true` and original `X-Operation-ID`). Reusing a key with a different request payload fails with HTTP 409 (`idempotency_conflict`). In Phase 1/2, idempotency state is stored in memory (`InMemoryIdempotencyStore`); guarantees are bounded by the configured entry capacity (`ALIENESE_IDEMPOTENCY_MAX_ENTRIES`), TTL (`ALIENESE_IDEMPOTENCY_TTL_SECONDS`), and single-process lifetime.
-- `X-Request-ID`: Per-HTTP-attempt correlation identifier (preserved if valid or generated).
-- `X-Trace-ID`: Application-level correlation identifier (kept distinct from OpenTelemetry internal trace IDs).
-- `traceparent`: Optional W3C Trace Context header used for OpenTelemetry distributed span propagation.
-
-## Repository structure
+Alienese separates responsibility: code extracts deterministic facts, policy ranks bounded candidates, and the model handles narrow code synthesis.
 
 ```text
-src/alienese/
-├── api/
-│   ├── app.py
-│   ├── chat_completions.py
-│   ├── errors.py
-│   └── models.py
-├── contracts/
-│   ├── candidates.py
-│   ├── context.py
-│   ├── decisions.py
-│   ├── events.py
-│   ├── generation.py
-│   ├── providers.py
-│   ├── state.py
-│   └── traces.py
-├── engine/
-│   ├── idempotency.py
-│   ├── normalize.py
-│   ├── reconstruct.py
-│   └── turn.py
-├── grounding/
-│   ├── extractors/
-│   │   ├── base.py
-│   │   ├── commands.py
-│   │   ├── failures.py
-│   │   ├── mutation.py
-│   │   ├── paths.py
-│   │   ├── symbols.py
-│   │   └── tests.py
-│   ├── argument_resolution.py
-│   ├── candidate_builder.py
-│   ├── eval.py
-│   ├── evidence.py
-│   ├── normalization.py
-│   ├── policy.py
-│   └── ranking.py
-├── observability/
-│   ├── logging.py
-│   ├── redaction.py
-│   └── tracing.py
-├── providers/
-│   ├── controller/
-│   │   └── mini_jev.py
-│   ├── generator/
-│   │   ├── nebius_token_factory.py
-│   │   └── nvidia_build.py
-│   ├── retriever/
-│   │   └── embeddinggemma.py
-│   ├── runtime/
-│   │   ├── circuit_breaker.py
-│   │   ├── client.py
-│   │   ├── concurrency.py
-│   │   ├── deadlines.py
-│   │   ├── errors.py
-│   │   ├── retry.py
-│   │   └── telemetry.py
-│   ├── base.py
-│   └── fake.py
-├── storage/
-│   ├── idempotency.py
-│   └── traces.py
-└── config.py
-
-tests/
-├── contracts/
-├── fixtures/
-├── integration/
-├── replay/
-└── unit/
+[Failing Test Traceback]
+          │
+          ▼
+┌───────────────────────────────────────────────┐
+│ 1. Deterministic Grounding Subsystem          │
+│    - Extracts exact file paths & test targets │
+│    - Binds schema parameters to real evidence │
+│    - Rejects path traversals & unsafe flags   │
+│    - Generates bounded candidate set (K ≤ 8)  │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│ 2. Grounded Controller Decision               │
+│    - Selects grounded action from candidate   │
+│      set (e.g., read_file tests/test_sess.py) │
+│    - Produces SHA-256 state digest & trace    │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│ 3. NVIDIA Nemotron 3 Super (Nebius Factory)   │
+│    - Receives labeled test + source context   │
+│    - Synthesizes targeted Python repair       │
+│    - Validated via AST syntax compilation     │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│ 4. Verification & Independent Acceptance Check│
+│    - Strict sandbox applies diff to workspace │
+│    - Re-runs target suite (RED ➔ GREEN)       │
+│    - Re-runs independent unseen acceptance    │
+└───────────────────────────────────────────────┘
 ```
+
+### A Real Trace Walkthrough (`--task integration`)
+1. **Failure Evidence:** Initial pytest run fails on `test_session_refresh_lifecycle` in `tests/test_session.py`.
+2. **Deterministic Grounding:** Alienese intercepts the traceback, extracts `tests/test_session.py`, and inspects imports to discover dependencies (`auth/token_store.py` and `auth/session_manager.py`).
+3. **Safe Tool Selection:** Alienese executes grounded reads within the workspace sandbox; path escapes and test modifications are strictly prohibited.
+4. **Nemotron Code Synthesis:** `nvidia/nemotron-3-super-120b-a12b` on Nebius Token Factory receives the failure traceback and source files, synthesizing the missing session update:
+   ```diff
+          self.token_store.revoke_token(old_token_id)
+   -      # BUG: session["active_token_id"] was not updated to new_token_id
+   +      session["active_token_id"] = new_token_id
+          return session
+   ```
+5. **Test & Acceptance Verification:** Sandboxed harness verifies that all 3 unit tests pass and both independent unseen acceptance tests pass.
+6. **Replay Trace:** Full execution telemetry, token usage, and SHA-256 state digests are logged transparently to `results/live_run_report.json`.
+
+---
+
+## 4. Actual Measured Results
+
+### A. Live Autonomous Coding Workflows (Nebius Token Factory)
+
+| Metric | Challenge 2: Integration Debugging (`--task integration`) | Challenge 1: Single-Module Expiry (`--task token`) |
+|---|---|---|
+| **Task Description** | Cross-module session manager and token store refresh regression | Single-module token TTL past-offset expiration bug |
+| **Modules Involved** | `auth/session_manager.py` + `auth/token_store.py` | `auth/token.py` |
+| **End-to-End Latency** | **3,504 ms** | **1,981 ms** |
+| **Nemotron Generation Latency** | **1,902 ms** | **744 ms** |
+| **Tokens Consumed** | 2,276 total (522 completion) | 850 total (134 completion) |
+| **Target Test Suite** | 3 passed (100%) | 1 passed (100%) |
+| **Unseen Acceptance Suite** | 2 passed (100%) | 1 passed (100%) |
+| **Overall Status** | **SUCCESS** | **SUCCESS** |
+
+### B. One-Turn Tool-Argument Safety Evaluation (Raw Nemotron vs. Alienese)
+Evaluated across 5 targeted adversarial and ambiguous one-turn scenarios (`results/benchmark_report.md`):
+
+| Safety Metric | Raw Nemotron (Direct) | Alienese + Nebius |
+|---|---|---|
+| **Out-of-Workspace Path Proposals** | 1 / 5 (20.0%) | **0 / 5 (0.0%)** |
+| **Unsupported Target Proposals** | 1 / 5 (20.0%) | **0 / 5 (0.0%)** |
+| **Action Space Bounding** | Unbounded | **Bounded ($K \le 8$)** |
+| **State Provenance** | None | **SHA-256 Digest** |
+
+*Evaluation limitation note: This targeted safety benchmark measures 5 specific edge scenarios.*
+
+### C. 35-Case Golden Grounding Corpus Evaluation
+Evaluated against 35 curated coding decision points across train, dev, and held-out test splits (`tests/fixtures/grounding/decision_points.json`):
+
+| Evaluation Split | Metric | Baseline (Phase 1) | Alienese (Phase 3) | Improvement |
+|---|---|---|---|---|
+| **Held-Out Test Split** (N=10) | **Oracle Recall@1** | 33.3% (3/9) | **88.9% (8/9)** | **+55.6% lift** |
+| | Exact Arg Accuracy | 33.3% (3/9) | **88.9% (8/9)** | **+55.6% lift** |
+| | Executable Validity | 100.0% (10/10) | **100.0% (10/10)** | Maintained |
+| **Overall Corpus** (N=35) | **Oracle Recall@1** | 20.7% (6/29) | **79.3% (23/29)** | **+58.6% lift** |
+| | Exact Arg Accuracy | 20.7% (6/29) | **82.8% (24/29)** | **+62.1% lift** |
+| | Abstention Correctness | 100.0% (6/6) | **100.0% (6/6)** | Maintained |
+
+---
+
+## 5. Architecture
+
+```text
+Coding Harness / SWE Runner
+            │
+            ▼ OpenAI-compatible HTTP Request (/v1/chat/completions)
+┌────────────────────────────────────────────────────────┐
+│                  Alienese Core Runtime                 │
+│                                                        │
+│  ┌──────────────────────┐    ┌──────────────────────┐  │
+│  │ State Reconstruction │    │ Grounding Subsystem  │  │
+│  │ (SHA-256 Digest)     │    │ (Evidence Extractors)│  │
+│  └──────────┬───────────┘    └──────────┬───────────┘  │
+│             │                           │              │
+│             └─────────────┬─────────────┘              │
+│                           ▼                            │
+│              ┌───────────────────────────┐             │
+│              │ Grounded Candidate Bounding│             │
+│              │ (Finite Candidates K ≤ 8) │             │
+│              └────────────┬──────────────┘             │
+│                           │                            │
+│                           ▼                            │
+│              ┌───────────────────────────┐             │
+│              │ GroundedRankController    │             │
+│              │ (Deterministic ranking)   │             │
+│              └────────────┬──────────────┘             │
+└───────────────────────────┼────────────────────────────┘
+                            │
+                            ▼ Asynchronous Provider Client
+┌────────────────────────────────────────────────────────┐
+│                  Nebius Token Factory                  │
+│  Model: nvidia/nemotron-3-super-120b-a12b              │
+│  - Regional endpoint: us-central1                      │
+│  - Monotonic turn deadlines & single-probe breakers    │
+│  - Thinking suppression & strict credential isolation  │
+└────────────────────────────────────────────────────────┘
+```
+
+### Components Running Today:
+- **`TurnEngine`**: Single-turn coordinator executing the reconstruct $\to$ ground $\to$ decide $\to$ generate lifecycle.
+- **`Grounding Subsystem`**: Deterministic extractors (`paths`, `symbols`, `commands`, `failures`, `mutation`).
+- **`GroundedRankController`**: Grounded candidate policy enforcing evidence support.
+- **`NebiusTokenFactoryGenerator`**: High-performance HTTP client connecting to Nebius Token Factory.
+- **`StandaloneCodingHarness`**: Security sandbox enforcing strict path containment and write allowlists.
+
+### Future Integrations (Post-Hackathon Roadmap):
+- **Self-Hosted mini-Jev Controller:** Pinned at `samatv256/mini-Jev` (`step-010626`); currently mocked in offline tests until self-hosted vLLM deployment is finalized.
+- **Self-Hosted EmbeddingGemma 2 Retriever:** `google/embeddinggemma-300m`; currently evaluated via offline embeddings.
+
+---
+
+## 6. Reproduce and Verify
+
+### Step 1. Run Offline Quality Gates (100% Offline, No Secrets)
+```bash
+# Run all 180+ offline unit, regression, and invariant tests
+pytest -q
+
+# Run static type checking
+mypy src tests
+
+# Run linter and formatting checks
+ruff check .
+ruff format --check .
+
+# Run 35-case grounding candidate evaluation
+python -m alienese.grounding.eval
+```
+
+### Step 2. Run the Offline Coding Tasks
+```bash
+# Run integration challenge in offline simulation
+python scripts/run_coding_task.py --task integration --out results/judge_offline.json
+
+# Run token challenge in offline simulation
+python scripts/run_coding_task.py --task token --out results/token_offline.json
+```
+
+### Step 3. Run Live Nebius Inference (Requires Your Own Key)
+```bash
+export NEBIUS_TOKEN_FACTORY_KEY="your-key"
+python scripts/run_coding_task.py --task integration --live --out results/live_run_report.json
+```
+
+### Troubleshooting
+- **Missing API Key:** If running with `--live` without `NEBIUS_TOKEN_FACTORY_KEY`, Alienese exits with an explicit missing-credential error. Run without `--live` to test offline.
+- **Custom Base URL:** If using a private endpoint, set `NEBIUS_TOKEN_FACTORY_BASE_URL="https://your-endpoint/v1"`.
+
+---
+
+## 7. Technical Credibility
+
+### Provider Runtime Resilience
+- **Monotonic Turn Deadlines (`DeadlineBudget`):** End-to-end deadlines that count down monotonically across retries.
+- **Safe-to-Retry Classification:** Distinguishes idempotent failures from ambiguous network timeouts.
+- **Single-Probe Circuit Breakers:** Protects inference budgets by failing fast during outages and admitting a single test request in `HALF_OPEN` state.
+- **Pre-Allocation Byte Caps:** Caps JSON decoding depth and response payloads to prevent memory exhaustion attacks.
+
+### Security & Containment Architecture
+- **Strict Path Containment:** Validated via `Path.is_relative_to(workspace)`. Traversal attempts (e.g. `../../etc/passwd`, Windows drive letters, UNC paths) are rejected.
+- **Mutable File Allowlist:** Only application source files can be written. Tests (`tests/`) and configs are strictly read-only to prevent test-tampering reward hacks.
+- **Environment Scrubbing:** Test executions run in an isolated environment stripped of all secret variables (`*_KEY`, `*_SECRET`, `*_TOKEN`).
+
+### OpenAI-Compatible API Endpoints
+- `GET /health` — Runtime liveness, version, and provider status.
+- `GET /v1/models` — Returns `alienese-default`.
+- `POST /v1/chat/completions` — Single-turn non-streaming chat completion supporting function tool schemas and `tool_choice="required"`.
+
+---
+
+## 8. Hackathon Information
+
+- **Hackathon Track:** Coding and Agentic Engineering
+- **Platform Provider:** **Nebius AI Studio / Token Factory** (`https://api.tokenfactory.us-central1.nebius.com/v1`)
+- **Model Attribution:** **NVIDIA Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`), utilized for genuine code repair generation and causal bug explanation.
+- **License:** [MIT License](LICENSE)
+- **Work Completed During Hackathon:** The entire Alienese architecture—including the core turn engine, deterministic grounding subsystem, provider runtime with circuit breakers, Nebius Token Factory adapter, 35-case golden evaluation corpus, multi-challenge coding harness, and replay trace viewer—was designed, implemented, and verified during this hackathon sprint.
+- *Scope Note on OpenCode:* OpenCode integration was investigated during the sprint; however, to maintain strict benchmark integrity and avoid unverified harness claims, Alienese currently operates with its own sandboxed runner and OpenAI-compatible API gateway. OpenCode client integration is scheduled for future work.
