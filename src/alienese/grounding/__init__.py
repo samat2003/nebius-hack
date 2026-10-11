@@ -8,6 +8,7 @@ from alienese.grounding.candidate_builder import (
     GroundingDiagnostics,
     deterministic_candidate_id,
 )
+from alienese.grounding.controller import GroundedRankController
 from alienese.grounding.evidence import (
     EvidenceCategory,
     EvidenceStatus,
@@ -29,6 +30,7 @@ __all__ = [
     "EvidenceCategory",
     "EvidenceStatus",
     "GroundedArgumentResolver",
+    "GroundedRankController",
     "GroundingDiagnostics",
     "GroundingEvidence",
     "deduplicate_evidence",
