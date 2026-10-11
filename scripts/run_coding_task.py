@@ -434,8 +434,10 @@ async def run_failing_to_passing_workflow(
         print(f"Grounded candidates count: {artifact1.semantics.candidate_count}")
         print(f"Replay verified: {artifact1.semantics.replayable}")
 
-        ok1, file_content = harness.execute_tool(tool_name_1, tool_args_1)
-        print(f"Tool executed: read {len(file_content)} bytes")
+        ok1, inspected_test_content = harness.execute_tool(tool_name_1, tool_args_1)
+        if not ok1:
+            raise RuntimeError(f"Grounded tool call {tool_name_1}({tool_args_1}) failed: {inspected_test_content}")
+        print(f"Tool executed: read {len(inspected_test_content)} bytes from {tool_args_1.get('path')}")
         steps_log.append(
             {
                 "step": 2,
@@ -447,16 +449,34 @@ async def run_failing_to_passing_workflow(
             }
         )
 
-        # Step 4: Turn 2 - Genuine Model Code Generation
-        # Feed the failing test output, grounded source path, and actual buggy source code to Nemotron
+        # Step 4: Explicitly read actual target source file (auth/token.py) from disposable workspace
+        print("\n[Step 2b] Reading target module 'auth/token.py' from disposable workspace...")
+        ok_src, actual_source_content = harness.execute_tool("read_file", {"path": "auth/token.py"})
+        if not ok_src:
+            raise RuntimeError(f"Failed to read target source file auth/token.py: {actual_source_content}")
+        print(f"Target module read: {len(actual_source_content)} bytes")
+        steps_log.append(
+            {
+                "step": 2.5,
+                "action": "read_source",
+                "path": "auth/token.py",
+                "success": ok_src,
+                "bytes_read": len(actual_source_content),
+            }
+        )
+
+        # Step 5: Turn 2 - Genuine Model Code Generation
+        # Feed the failing test output, test file content, and actual source file content to Nemotron
         print("\n[Step 3] Turn 2: Requesting genuine code repair from Nemotron 3 Super...")
         repair_prompt = (
             "You are an expert Python software engineer.\n"
             "A test failed in the test suite:\n"
             f"{test_out}\n\n"
-            "Here is the current content of 'auth/token.py':\n"
-            f"{file_content}\n\n"
-            "Fix the bug in 'auth/token.py' so that the token validation works as intended.\n"
+            f"Here is the content of the failing test file '{tool_args_1.get('path')}':\n"
+            f"{inspected_test_content}\n\n"
+            "Here is the current content of the source file 'auth/token.py':\n"
+            f"{actual_source_content}\n\n"
+            "Fix the bug in 'auth/token.py' so that the token validation works as intended and all tests pass.\n"
             "Output ONLY the complete, corrected Python code for 'auth/token.py' inside a ```python``` code block.\n"
             "Do not include any explanation before or after."
         )
