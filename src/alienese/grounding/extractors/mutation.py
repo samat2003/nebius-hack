@@ -139,21 +139,31 @@ def classify_mutation_outcome(
                 if data.get("success") is False or data.get("status") in ("error", "failed"):
                     return False, EvidenceStatus.FAILED
 
-                # Verify target path match if path is provided in JSON
-                json_path = (
-                    data.get("path")
-                    or data.get("filepath")
-                    or data.get("file_path")
-                    or data.get("target_file")
-                    or data.get("file")
-                )
-                if json_path and isinstance(json_path, str):
-                    norm_json_path = normalize_file_path(json_path)
-                    if norm_json_path and norm_json_path != target_file:
-                        # Output confirms a different file, not target_file!
+                # If JSON explicitly includes a target path property, require it to be
+                # a valid, normalized path exactly matching target_file.
+                path_keys = ("path", "filepath", "file_path", "target_file", "file")
+                has_explicit_path = any(k in data for k in path_keys)
+
+                if has_explicit_path:
+                    raw_path = None
+                    for k in path_keys:
+                        if k in data:
+                            raw_path = data[k]
+                            break
+
+                    if not isinstance(raw_path, str):
+                        # Non-string path is malformed/unconfirmed
                         return False, EvidenceStatus.OBSERVED
 
-                # Check for positive status or success flag
+                    norm_json_path = normalize_file_path(raw_path)
+                    if norm_json_path is None or norm_json_path != target_file:
+                        # Malformed, out-of-workspace, or mismatched path remains unconfirmed
+                        return False, EvidenceStatus.OBSERVED
+
+                # Check for positive status or success flag.
+                # Note: Pathless success responses (e.g. {"success": true} or {"status": "ok"})
+                # are preserved only where originating tool-call correlation with call_ev
+                # provides a documented basis for establishing the specific target_file.
                 if data.get("success") is True or data.get("status") in (
                     "ok",
                     "success",

@@ -239,8 +239,9 @@ Computes and reports:
   - `Oracle Recall@8`: fraction where oracle is in top 8
 - **Secondary**:
   - `Executable Validity Rate`: % of executable candidates that pass schema validation
-  - `Argument Completeness Rate`: % of required arguments grounded
-  - `Fabrication Count`: count of ungrounded/invented arguments (must be 0)
+  - `Arg Presence Rate`: % of required arguments grounded
+  - `Evidence Support (Proxy)`: % of bound arguments verified against extracted evidence or validated tool schema defaults (must be 100%)
+  - `Unsupported Arg Count`: count of ungrounded/invented arguments (must be 0)
   - `Deduplication Rate`: % of redundant actions suppressed
   - `Phase 1 Baseline Comparison`: side-by-side metric comparison demonstrating significant lift
 
@@ -277,7 +278,7 @@ Following independent code review of PR #4, the grounding subsystem addressed fi
 2. **Command Grounding Security**: Narrows command execution to recognized verification commands (`pytest`, `python -m unittest`, `ruff`, `mypy`). Rejects shell chaining (`&&`, `;`, `||`), pipelines (`|`), redirections (`>`, `<`), substitutions (`$()`), and destructive commands (`rm`, `curl`, `sh`, `bash`).
 3. **Explicit Verification Outcomes**: Implemented bounded outcome classifier: `PASSED` (only explicit recognized test reports produce `CONFIRMED`), `FAILED` (explicit test failure/error or non-zero exit), and `UNKNOWN` (empty, 0 tests collected, interrupted, partial output).
 4. **Tool-Choice Eligibility Before Truncation**: Enforces candidate eligibility for named-tool, `required`, and `none` modes before applying the $K=8$ candidate limit (`max_k >= 1` enforced), preventing named tools from being truncated by other tools.
-5. **Evaluation Correctness & Faithfulness**: Fixed baseline CandidateAction initialization (`generation_job_type=GenerationJobType.ANSWER`). Separated positive-action selection from abstention correctness. Revalidates all candidates against actual JSON schemas and reports explicit denominators and exact fabrication counts (checking evidence set and schema defaults).
+5. **Evaluation Correctness & Faithfulness**: Fixed baseline CandidateAction initialization (`generation_job_type=GenerationJobType.ANSWER`). Separated positive-action selection from abstention correctness. Revalidates all candidates against actual JSON schemas and reports explicit denominators and exact evidence support proxy rates (checking extracted evidence and tool schema defaults without unhashable-object crashes).
 
 ### Measured Evaluation Results (Golden Corpus N=35)
 
@@ -290,13 +291,15 @@ Following independent code review of PR #4, the grounding subsystem addressed fi
 | | **Arg Presence Rate** | 2/8 (25.0%) | **8/8 (100.0%)** | **+75.0%** |
 | | **Abstention Correctness** | 1/1 (100.0%) | **1/1 (100.0%)** | +0.0% |
 | | **Executable Validity Rate**| 2/2 (100.0%) | **10/10 (100.0%)** | 0.0% |
-| | **Fabrication Count** | 0/2 | **0/10** | 0 |
+| | **Evidence Support (Proxy)**| 2/2 (100.0%) | **10/10 (100.0%)** | +0.0% |
+| | **Unsupported Arg Count** | 0/2 | **0/10** | 0 |
 | **ALL COMBINED (N=35)** | **Oracle Recall@1** | 6/29 (20.7%) | **23/29 (79.3%)** | **+58.6%** |
 | *(Action N=29, Abstain N=6)*| **Oracle Recall@4** | 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
 | | **Oracle Recall@8** | 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
 | | **Exact Arg Accuracy** | 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
-| | **Arg Presence Rate** | 6/25 (24.0%) | **23/26 (88.5%)** | **+64.5%** |
+| | **Arg Presence Rate** | 6/25 (24.0%) | **22/26 (84.6%)** | **+60.6%** |
 | | **Abstention Correctness** | 6/6 (100.0%) | **6/6 (100.0%)** | +0.0% |
-| | **Executable Validity Rate**| 6/6 (100.0%) | **28/28 (100.0%)** | 0.0% |
-| | **Fabrication Count** | 0/6 | **0/28** | 0 |
+| | **Executable Validity Rate**| 6/6 (100.0%) | **27/27 (100.0%)** | 0.0% |
+| | **Evidence Support (Proxy)**| 6/6 (100.0%) | **27/27 (100.0%)** | +0.0% |
+| | **Unsupported Arg Count** | 0/6 | **0/27** | 0 |
 

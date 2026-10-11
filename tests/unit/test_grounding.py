@@ -908,16 +908,55 @@ def test_mutation_extractor_positive_confirmation() -> None:
     assert is_conf is True
     assert status == EvidenceStatus.CONFIRMED
 
-    # Positive confirmation JSON
+    # Positive confirmation JSON with matching path
     is_conf, status = classify_mutation_outcome(
         '{"status": "ok", "path": "' + target + '"}', target
     )
     assert is_conf is True
     assert status == EvidenceStatus.CONFIRMED
 
+    is_conf, status = classify_mutation_outcome(
+        '{"success": true, "path": "./' + target + '"}', target
+    )
+    assert is_conf is True
+    assert status == EvidenceStatus.CONFIRMED
+
+    # Preserved pathless success responses (correlated via originating tool call)
     is_conf, status = classify_mutation_outcome('{"success": true}', target)
     assert is_conf is True
     assert status == EvidenceStatus.CONFIRMED
+
+    is_conf, status = classify_mutation_outcome('{"status": "ok"}', target)
+    assert is_conf is True
+    assert status == EvidenceStatus.CONFIRMED
+
+    # Regression: JSON with absolute path /etc/passwd must remain unconfirmed
+    is_conf, status = classify_mutation_outcome('{"success": true, "path": "/etc/passwd"}', target)
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # Regression: JSON with invalid escaping relative path must remain unconfirmed
+    is_conf, status = classify_mutation_outcome(
+        '{"success": true, "path": "../../outside.py"}', target
+    )
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # Regression: JSON with non-string path (number, null, array) must remain unconfirmed
+    is_conf, status = classify_mutation_outcome('{"success": true, "path": 12345}', target)
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    is_conf, status = classify_mutation_outcome('{"success": true, "path": null}', target)
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # Regression: JSON with explicitly different target must remain unconfirmed
+    is_conf, status = classify_mutation_outcome(
+        '{"success": true, "path": "src/other/file.py"}', target
+    )
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
 
 
 def test_eval_evidence_support_handles_unhashable_structures() -> None:
