@@ -24,7 +24,6 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from alienese.api.errors import (
-    CompatibilityError,
     InvalidProviderResponse,
     InvariantViolation,
 )
@@ -34,14 +33,12 @@ from alienese.api.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     FunctionCallOutput,
-    NamedToolChoice,
     ToolCallOutput,
     UsageInfo,
 )
 from alienese.contracts.candidates import (
     CandidateAction,
     CandidateDisposition,
-    CostClass,
     RiskClass,
 )
 from alienese.contracts.context import RequestContext
@@ -506,93 +503,21 @@ def extract_deterministic_tool_arguments(
 def build_deterministic_candidates(
     state: WorkingState,
     request: ChatCompletionRequest,
+    events: Sequence[NormalizedEvent] | None = None,
 ) -> tuple[CandidateAction, ...]:
-    """Construct a finite deterministic set of CandidateActions for the current turn."""
-    tool_choice = request.tool_choice
-    candidates: list[CandidateAction] = []
+    """Construct a finite deterministic set of CandidateActions for the current turn.
 
-    answer_candidate = CandidateAction(
-        candidate_id="cand_answer",
-        canonical_intent=CanonicalCapability.RESPOND,
-        disposition=CandidateDisposition.GENERATION_JOB,
-        requires_generation=True,
-        generation_job_type=GenerationJobType.ANSWER,
-        risk_class=RiskClass.LOW,
-        cost_class=CostClass.LOW,
-        rationale="Synthesize a direct assistant response to the latest user request.",
+    Delegates to the Phase 3 CandidateBuilder engine while preserving the Phase 1 signature.
+    """
+    from alienese.grounding.candidate_builder import CandidateBuilder
+
+    builder = CandidateBuilder()
+    candidates, _evidence, _diagnostics = builder.build_candidates(
+        events=events or (),
+        state=state,
+        tool_choice=request.tool_choice,
     )
-
-    if tool_choice == "none" or not state.available_tools:
-        return (answer_candidate,)
-
-    if isinstance(tool_choice, NamedToolChoice):
-        target_name = tool_choice.function.name
-        matched = [t for t in state.available_tools if t.external_name == target_name]
-        if not matched:
-            raise CompatibilityError(
-                f"Requested tool '{target_name}' is not present in available tools.",
-                param="tool_choice",
-            )
-        binding = matched[0]
-        args, is_complete = extract_deterministic_tool_arguments(binding)
-        if not is_complete:
-            raise CompatibilityError(
-                f"Tool '{target_name}' requires arguments that cannot be deterministically "
-                "grounded in Phase 1 without fabricating values.",
-                param="tool_choice",
-                code="ungrounded_required_tool_arguments",
-            )
-        tool_risk = classify_tool_risk(binding.canonical_capability)
-        return (
-            CandidateAction(
-                candidate_id=f"cand_tool_{binding.external_name}",
-                canonical_intent=binding.canonical_capability,
-                disposition=CandidateDisposition.EXTERNAL_TOOL,
-                external_tool_name=binding.external_name,
-                arguments=args,
-                arguments_complete=True,
-                requires_generation=False,
-                risk_class=tool_risk,
-                cost_class=CostClass.LOW,
-                rationale=f"Explicitly requested tool '{binding.external_name}'.",
-            ),
-        )
-
-    for binding in state.available_tools:
-        args, is_complete = extract_deterministic_tool_arguments(binding)
-        tool_risk = classify_tool_risk(binding.canonical_capability)
-        candidates.append(
-            CandidateAction(
-                candidate_id=f"cand_tool_{binding.external_name}",
-                canonical_intent=binding.canonical_capability,
-                disposition=CandidateDisposition.EXTERNAL_TOOL,
-                external_tool_name=binding.external_name,
-                arguments=args,
-                arguments_complete=is_complete,
-                requires_generation=False,
-                risk_class=tool_risk,
-                cost_class=CostClass.LOW,
-                rationale=f"Candidate for external tool '{binding.external_name}'.",
-            )
-        )
-
-    if tool_choice == "required":
-        # Conservative fake-mode policy: generic `tool_choice="required"` only
-        # auto-selects low-risk tools with complete deterministic arguments.
-        safe_executable_tools = [
-            c for c in candidates if c.arguments_complete and c.risk_class == RiskClass.LOW
-        ]
-        if not safe_executable_tools:
-            raise CompatibilityError(
-                "tool_choice='required' was specified, but no low-risk tool has "
-                "deterministically complete required arguments in Phase 1.",
-                param="tool_choice",
-                code="ungrounded_required_tool_arguments",
-            )
-        return tuple(safe_executable_tools)
-
-    candidates.append(answer_candidate)
-    return tuple(candidates)
+    return candidates
 
 
 def enforce_executable_candidate_invariant(
@@ -820,7 +745,7 @@ class TurnEngine:
 
             # 3. Construct finite deterministic candidate set
             with self._tracer.span("candidates.construct") as cand_span:
-                candidates = build_deterministic_candidates(state, request)
+                candidates = build_deterministic_candidates(state, request, events=events)
                 if not candidates:
                     raise InvariantViolation("Candidate construction produced an empty set.")
                 self._tracer.set_attributes_safe(
