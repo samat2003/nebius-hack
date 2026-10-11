@@ -100,17 +100,20 @@ Implemented deliverables:
 | **Held-Out Test Arg Presence Rate** | 2/8 (25.0%) | **8/8 (100.0%)** | **+75.0%** |
 | **Held-Out Test Abstention Correctness** | 1/1 (100.0%) | **1/1 (100.0%)** | +0.0% |
 | **Held-Out Test Executable Validity** | 2/2 (100.0%) | **10/10 (100.0%)** | 0.0% |
-| **Held-Out Test Fabrication Count** | 0/2 | **0/10** | 0 |
+| **Held-Out Test Evidence Support (Proxy)** | 2/2 (100.0%) | **10/10 (100.0%)** | +0.0% |
+| **Held-Out Test Unsupported Args** | 0/2 | **0/10** | 0 |
 | **Overall (Action N=29) Oracle Recall@1** | 6/29 (20.7%) | **23/29 (79.3%)** | **+58.6%** |
 | **Overall (Action N=29) Oracle Recall@4/8**| 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
 | **Overall (Action N=29) Exact Arg Accuracy**| 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
+| **Overall (Action N=29) Arg Presence Rate** | 6/25 (24.0%) | **22/26 (84.6%)** | **+60.6%** |
 | **Overall (Abstain N=6) Abstention Correctness**| 6/6 (100.0%) | **6/6 (100.0%)** | +0.0% |
-| **Overall (N=28) Executable Validity** | 6/6 (100.0%) | **28/28 (100.0%)** | 0.0% |
-| **Overall Fabrication Count** | 0/6 | **0/28** | 0 |
+| **Overall Executable Validity** | 6/6 (100.0%) | **27/27 (100.0%)** | 0.0% |
+| **Overall Evidence Support (Proxy)** | 6/6 (100.0%) | **27/27 (100.0%)** | +0.0% |
+| **Overall Unsupported Args** | 0/6 | **0/27** | 0 |
 
 ### Quality gate
 
-Passed: On the 35-point curated decision set (Action N=29, Abstain N=6), Oracle Recall@1 reached 88.9% on held-out test (79.3% overall) with 100% abstention correctness, zero fabrications, and 100% executable validity before mini-Jev is allowed to control production decisions.
+Passed: On the 35-point curated decision set (Action N=29, Abstain N=6), Oracle Recall@1 reached 88.9% on held-out test (79.3% overall) with 100% abstention correctness, zero unsupported arguments (100% evidence-support proxy), and 100% executable validity before mini-Jev is allowed to control production decisions.
 
 ---
 

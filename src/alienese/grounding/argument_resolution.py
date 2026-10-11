@@ -21,7 +21,11 @@ from alienese.engine.turn import (
     validate_tool_arguments_against_schema,
 )
 from alienese.grounding.evidence import EvidenceCategory, GroundingEvidence
-from alienese.grounding.normalization import is_safe_verification_command
+from alienese.grounding.normalization import (
+    is_safe_verification_command,
+    normalize_file_path,
+    normalize_test_target,
+)
 
 _PATH_PROPERTY_NAMES: tuple[str, ...] = (
     "path",
@@ -102,7 +106,8 @@ class GroundedArgumentResolver:
         if schema.get("type", "object") != "object":
             return {}, False, ()
 
-        arguments = self.extract_defaults(schema)
+        schema_defaults = self.extract_defaults(schema)
+        arguments = copy.deepcopy(schema_defaults)
         properties = schema.get("properties", {})
         if not isinstance(properties, Mapping):
             properties = {}
@@ -126,6 +131,7 @@ class GroundedArgumentResolver:
                 evidence_items,
                 primary_evidence,
                 bound_evidence,
+                schema_defaults=schema_defaults,
             )
 
         elif capability == CanonicalCapability.RUN_TEST:
@@ -135,6 +141,7 @@ class GroundedArgumentResolver:
                 evidence_items,
                 primary_evidence,
                 bound_evidence,
+                schema_defaults=schema_defaults,
             )
 
         elif capability in (
@@ -147,6 +154,7 @@ class GroundedArgumentResolver:
                 evidence_items,
                 primary_evidence,
                 bound_evidence,
+                schema_defaults=schema_defaults,
             )
 
         elif capability == CanonicalCapability.RUN_COMMAND:
@@ -156,14 +164,50 @@ class GroundedArgumentResolver:
                 evidence_items,
                 primary_evidence,
                 bound_evidence,
+                schema_defaults=schema_defaults,
             )
 
-        # Validate arguments against the fail-closed JSON Schema
-        is_valid, _reason = validate_tool_arguments_against_schema(schema, arguments)
-        is_complete = is_valid and required_props.issubset(arguments.keys())
+        is_complete = True
 
-        # For RUN_COMMAND, ensure command argument is a recognized safe verification command
-        if capability == CanonicalCapability.RUN_COMMAND:
+        # Validate final candidate arguments against capability boundaries
+        # regardless of whether values originated from evidence or schema defaults.
+        # Note: Physical symlink containment is the coding harness's runtime sandbox
+        # responsibility, but Alienese must never propose syntactically escaping
+        # or uncontained paths.
+        if capability in (
+            CanonicalCapability.READ_FILE,
+            CanonicalCapability.LIST_FILES,
+            CanonicalCapability.WRITE_FILE,
+            CanonicalCapability.APPLY_PATCH,
+        ):
+            for prop in _PATH_PROPERTY_NAMES:
+                if prop in arguments:
+                    val = arguments[prop]
+                    if not isinstance(val, str):
+                        is_complete = False
+                        del arguments[prop]
+                    else:
+                        norm = normalize_file_path(val)
+                        if norm is None:
+                            is_complete = False
+                            del arguments[prop]
+                        else:
+                            arguments[prop] = norm
+
+        elif capability == CanonicalCapability.RUN_TEST:
+            for prop in _TEST_TARGET_PROPERTY_NAMES:
+                if prop in arguments and prop not in _COMMAND_PROPERTY_NAMES:
+                    val = arguments[prop]
+                    if not isinstance(val, str):
+                        is_complete = False
+                        del arguments[prop]
+                    else:
+                        norm = normalize_test_target(val)
+                        if norm is None:
+                            is_complete = False
+                            del arguments[prop]
+                        else:
+                            arguments[prop] = norm
             for cmd_key in _COMMAND_PROPERTY_NAMES:
                 if cmd_key in arguments:
                     cmd_val = arguments[cmd_key]
@@ -171,8 +215,28 @@ class GroundedArgumentResolver:
                         is_safe, _ = is_safe_verification_command(cmd_val)
                         if not is_safe:
                             is_complete = False
+                            del arguments[cmd_key]
                     else:
                         is_complete = False
+                        del arguments[cmd_key]
+
+        elif capability == CanonicalCapability.RUN_COMMAND:
+            for cmd_key in _COMMAND_PROPERTY_NAMES:
+                if cmd_key in arguments:
+                    cmd_val = arguments[cmd_key]
+                    if isinstance(cmd_val, str):
+                        is_safe, _ = is_safe_verification_command(cmd_val)
+                        if not is_safe:
+                            is_complete = False
+                            del arguments[cmd_key]
+                    else:
+                        is_complete = False
+                        del arguments[cmd_key]
+
+        # Validate arguments against the fail-closed JSON Schema and ensure required props present
+        is_valid, _reason = validate_tool_arguments_against_schema(schema, arguments)
+        if not is_valid or not required_props.issubset(arguments.keys()):
+            is_complete = False
 
         # High risk mutations (APPLY_PATCH, WRITE_FILE) must not be executable
         # if patch or content was fabricated or missing
@@ -190,27 +254,40 @@ class GroundedArgumentResolver:
         evidence_items: Sequence[GroundingEvidence],
         primary_evidence: GroundingEvidence | None,
         bound_evidence: list[GroundingEvidence],
+        schema_defaults: Mapping[str, Any] | None = None,
     ) -> None:
         target_prop = None
         for prop in _PATH_PROPERTY_NAMES:
             if prop in properties:
                 target_prop = prop
                 break
-        if not target_prop or target_prop in arguments:
+        if not target_prop:
+            return
+
+        is_default_only = (
+            schema_defaults is not None
+            and target_prop in schema_defaults
+            and arguments.get(target_prop) == schema_defaults.get(target_prop)
+        )
+        if target_prop in arguments and not is_default_only:
             return
 
         # Prefer primary evidence if FILE_PATH
         if primary_evidence and primary_evidence.category == EvidenceCategory.FILE_PATH:
-            arguments[target_prop] = primary_evidence.value
-            bound_evidence.append(primary_evidence)
-            return
+            norm = normalize_file_path(primary_evidence.value)
+            if norm:
+                arguments[target_prop] = norm
+                bound_evidence.append(primary_evidence)
+                return
 
         # Search extracted evidence
         for evi in evidence_items:
             if evi.category == EvidenceCategory.FILE_PATH:
-                arguments[target_prop] = evi.value
-                bound_evidence.append(evi)
-                return
+                norm = normalize_file_path(evi.value)
+                if norm:
+                    arguments[target_prop] = norm
+                    bound_evidence.append(evi)
+                    return
 
     def _ground_test_argument(
         self,
@@ -219,34 +296,49 @@ class GroundedArgumentResolver:
         evidence_items: Sequence[GroundingEvidence],
         primary_evidence: GroundingEvidence | None,
         bound_evidence: list[GroundingEvidence],
+        schema_defaults: Mapping[str, Any] | None = None,
     ) -> None:
         target_prop = None
         for prop in _TEST_TARGET_PROPERTY_NAMES:
-            if prop in properties:
+            if prop in properties and prop not in _COMMAND_PROPERTY_NAMES:
                 target_prop = prop
                 break
-        if not target_prop or target_prop in arguments:
+        if not target_prop:
+            return
+
+        is_default_only = (
+            schema_defaults is not None
+            and target_prop in schema_defaults
+            and arguments.get(target_prop) == schema_defaults.get(target_prop)
+        )
+        if target_prop in arguments and not is_default_only:
             return
 
         # Prefer primary evidence if TEST_TARGET
         if primary_evidence and primary_evidence.category == EvidenceCategory.TEST_TARGET:
-            arguments[target_prop] = primary_evidence.value
-            bound_evidence.append(primary_evidence)
-            return
+            norm = normalize_test_target(primary_evidence.value)
+            if norm:
+                arguments[target_prop] = norm
+                bound_evidence.append(primary_evidence)
+                return
 
         # Search extracted evidence for TEST_TARGET
         for evi in evidence_items:
             if evi.category == EvidenceCategory.TEST_TARGET:
-                arguments[target_prop] = evi.value
-                bound_evidence.append(evi)
-                return
+                norm = normalize_test_target(evi.value)
+                if norm:
+                    arguments[target_prop] = norm
+                    bound_evidence.append(evi)
+                    return
 
         # Fallback to test file paths
         for evi in evidence_items:
             if evi.category == EvidenceCategory.FILE_PATH and ("test" in evi.value.lower()):
-                arguments[target_prop] = evi.value
-                bound_evidence.append(evi)
-                return
+                norm = normalize_test_target(evi.value)
+                if norm:
+                    arguments[target_prop] = norm
+                    bound_evidence.append(evi)
+                    return
 
     def _ground_search_argument(
         self,
@@ -255,13 +347,22 @@ class GroundedArgumentResolver:
         evidence_items: Sequence[GroundingEvidence],
         primary_evidence: GroundingEvidence | None,
         bound_evidence: list[GroundingEvidence],
+        schema_defaults: Mapping[str, Any] | None = None,
     ) -> None:
         target_prop = None
         for prop in _SEARCH_QUERY_PROPERTY_NAMES:
             if prop in properties:
                 target_prop = prop
                 break
-        if not target_prop or target_prop in arguments:
+        if not target_prop:
+            return
+
+        is_default_only = (
+            schema_defaults is not None
+            and target_prop in schema_defaults
+            and arguments.get(target_prop) == schema_defaults.get(target_prop)
+        )
+        if target_prop in arguments and not is_default_only:
             return
 
         if primary_evidence and primary_evidence.category in (
@@ -285,13 +386,22 @@ class GroundedArgumentResolver:
         evidence_items: Sequence[GroundingEvidence],
         primary_evidence: GroundingEvidence | None,
         bound_evidence: list[GroundingEvidence],
+        schema_defaults: Mapping[str, Any] | None = None,
     ) -> None:
         target_prop = None
         for prop in _COMMAND_PROPERTY_NAMES:
             if prop in properties:
                 target_prop = prop
                 break
-        if not target_prop or target_prop in arguments:
+        if not target_prop:
+            return
+
+        is_default_only = (
+            schema_defaults is not None
+            and target_prop in schema_defaults
+            and arguments.get(target_prop) == schema_defaults.get(target_prop)
+        )
+        if target_prop in arguments and not is_default_only:
             return
 
         # Only ground recognized safe verification commands

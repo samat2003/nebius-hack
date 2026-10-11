@@ -10,7 +10,11 @@ from alienese.grounding.evidence import GroundingEvidence
 from alienese.grounding.extractors.base import MAX_EVIDENCE_RECORDS, EvidenceExtractor
 from alienese.grounding.extractors.commands import CommandExtractor
 from alienese.grounding.extractors.failures import FailureExtractor
-from alienese.grounding.extractors.mutation import MutationExtractor
+from alienese.grounding.extractors.mutation import (
+    MutationExtractor,
+    classify_mutation_outcome,
+    classify_verification_outcome,
+)
 from alienese.grounding.extractors.paths import PathExtractor
 from alienese.grounding.extractors.symbols import SymbolExtractor
 from alienese.grounding.extractors.tests import TestExtractor
@@ -24,6 +28,8 @@ __all__ = [
     "PathExtractor",
     "SymbolExtractor",
     "TestExtractor",
+    "classify_mutation_outcome",
+    "classify_verification_outcome",
     "extract_all_evidence",
 ]
 

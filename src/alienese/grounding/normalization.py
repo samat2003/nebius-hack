@@ -164,11 +164,75 @@ def normalize_symbol_name(raw_symbol: str) -> str | None:
     return cleaned
 
 
-def is_safe_verification_command(command: str) -> tuple[bool, str | None]:
-    """Validate whether command is a safe, narrowly recognized verification command.
+_PYTEST_SAFE_FLAGS = frozenset(
+    {
+        "-v",
+        "-vv",
+        "-q",
+        "-qq",
+        "-x",
+        "-s",
+        "--disable-warnings",
+        "--strict-markers",
+        "--no-header",
+        "--show-capture=no",
+        "-rA",
+        "-rf",
+        "-ra",
+        "--tb=short",
+        "--tb=line",
+        "--tb=native",
+        "--tb=auto",
+        "--tb=no",
+        "--color=no",
+        "--color=yes",
+        "--color=auto",
+    }
+)
 
-    Rejects arbitrary shell pipelines, chaining, redirection, substitution,
-    destructive commands, and unsupported executables.
+_UNITTEST_SAFE_FLAGS = frozenset({"-v", "-q", "-f", "-b"})
+
+_RUFF_CHECK_SAFE_FLAGS = frozenset(
+    {
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "--exit-zero",
+        "--show-source",
+        "--no-fix",
+    }
+)
+
+_RUFF_FORMAT_SAFE_FLAGS = frozenset({"-q", "--quiet", "-v", "--verbose", "--diff"})
+
+_MYPY_SAFE_FLAGS = frozenset(
+    {
+        "--strict",
+        "--ignore-missing-imports",
+        "--follow-imports=silent",
+        "--follow-imports=skip",
+        "-v",
+        "-q",
+        "--no-error-summary",
+        "--show-error-codes",
+        "--no-incremental",
+    }
+)
+
+_SAFE_IDENTIFIER_EXPR = re.compile(r"^[a-zA-Z0-9_ and not or ()]+$")
+
+
+def is_safe_verification_command(command: str) -> tuple[bool, str | None]:
+    """Validate whether command is in a safe, validated verification-command form.
+
+    Enforces conservative, per-executable option allowlists and rejects
+    arbitrary shell pipelines, chaining, redirection, substitution, plugin loading
+    (e.g. pytest -p), config overrides, and unsupported executables.
+
+    Note: This syntactic validation guarantees safe verification-command form,
+    preventing command injection and dangerous flag abuse, but does not substitute
+    for process-level sandbox isolation by the execution harness.
     """
     if not command or not isinstance(command, str):
         return False, "empty_command"
@@ -196,7 +260,7 @@ def is_safe_verification_command(command: str) -> tuple[bool, str | None]:
     if exe not in _SAFE_EXECUTABLES:
         return False, f"unsupported_executable:{exe}"
 
-    # Verify python invocations
+    # Verify python invocations and determine command type
     if exe in ("python", "python3"):
         if len(tokens) < 3:
             return False, "incomplete_python_command"
@@ -205,29 +269,128 @@ def is_safe_verification_command(command: str) -> tuple[bool, str | None]:
         module = tokens[2]
         if module not in ("pytest", "unittest", "py_compile"):
             return False, f"unsupported_python_module:{module}"
+        tool_type = module
         sub_tokens = tokens[3:]
     elif exe == "pytest":
+        tool_type = "pytest"
         sub_tokens = tokens[1:]
     elif exe == "ruff":
         if len(tokens) < 2 or tokens[1] not in ("check", "format"):
             return False, "unsupported_ruff_subcommand"
-        if tokens[1] == "format" and (len(tokens) < 3 or tokens[2] != "--check"):
-            return False, "ruff_format_without_check_flag"
-        sub_tokens = tokens[2:] if tokens[1] == "check" else tokens[3:]
+        if tokens[1] == "format":
+            if len(tokens) < 3 or tokens[2] != "--check":
+                return False, "ruff_format_without_check_flag"
+            tool_type = "ruff_format"
+            sub_tokens = tokens[3:]
+        else:
+            tool_type = "ruff_check"
+            sub_tokens = tokens[2:]
     elif exe == "mypy":
+        tool_type = "mypy"
         sub_tokens = tokens[1:]
     else:
         return False, "unrecognized_executable"
 
-    # Validate remaining arguments (must be safe flags, paths, or test targets)
-    for tok in sub_tokens:
+    # Validate remaining arguments against per-executable conservative allowlists
+    idx = 0
+    while idx < len(sub_tokens):
+        tok = sub_tokens[idx]
         if tok.startswith("-"):
-            if not re.match(r"^--?[a-zA-Z0-9_\-=]+$", tok):
-                return False, f"invalid_flag:{tok}"
+            if tool_type == "pytest":
+                if tok in _PYTEST_SAFE_FLAGS:
+                    idx += 1
+                    continue
+                if tok in ("-k", "-m"):
+                    if idx + 1 >= len(sub_tokens):
+                        return False, f"missing_value_for_flag:{tok}"
+                    val_tok = sub_tokens[idx + 1]
+                    if not _SAFE_IDENTIFIER_EXPR.match(val_tok):
+                        return False, f"unsafe_flag_value:{tok}:{val_tok}"
+                    idx += 2
+                    continue
+                if tok.startswith("-k=") or tok.startswith("-m="):
+                    val_tok = tok.split("=", 1)[1]
+                    if not _SAFE_IDENTIFIER_EXPR.match(val_tok):
+                        return False, f"unsafe_flag_value:{tok}"
+                    idx += 1
+                    continue
+                if tok.startswith("--tb=") and tok in _PYTEST_SAFE_FLAGS:
+                    idx += 1
+                    continue
+                if tok.startswith("--maxfail="):
+                    val_tok = tok.split("=", 1)[1]
+                    if not val_tok.isdigit():
+                        return False, f"invalid_maxfail:{tok}"
+                    idx += 1
+                    continue
+                return False, f"disallowed_pytest_flag:{tok}"
+
+            elif tool_type == "unittest":
+                if tok in _UNITTEST_SAFE_FLAGS:
+                    idx += 1
+                    continue
+                if tok == "-k":
+                    if idx + 1 >= len(sub_tokens):
+                        return False, f"missing_value_for_flag:{tok}"
+                    val_tok = sub_tokens[idx + 1]
+                    if not _SAFE_IDENTIFIER_EXPR.match(val_tok):
+                        return False, f"unsafe_flag_value:{tok}:{val_tok}"
+                    idx += 2
+                    continue
+                if tok.startswith("-k="):
+                    val_tok = tok.split("=", 1)[1]
+                    if not _SAFE_IDENTIFIER_EXPR.match(val_tok):
+                        return False, f"unsafe_flag_value:{tok}"
+                    idx += 1
+                    continue
+                return False, f"disallowed_unittest_flag:{tok}"
+
+            elif tool_type == "py_compile":
+                return False, f"flags_not_supported_for_py_compile:{tok}"
+
+            elif tool_type == "ruff_check":
+                if tok in _RUFF_CHECK_SAFE_FLAGS:
+                    idx += 1
+                    continue
+                if tok.startswith("--select=") or tok.startswith("--ignore="):
+                    val_tok = tok.split("=", 1)[1]
+                    if not re.match(r"^[a-zA-Z0-9,]+$", val_tok):
+                        return False, f"unsafe_flag_value:{tok}"
+                    idx += 1
+                    continue
+                if tok.startswith("--output-format="):
+                    val_tok = tok.split("=", 1)[1]
+                    if val_tok not in ("text", "json", "grouped", "full", "concise"):
+                        return False, f"invalid_output_format:{tok}"
+                    idx += 1
+                    continue
+                return False, f"disallowed_ruff_flag:{tok}"
+
+            elif tool_type == "ruff_format":
+                if tok in _RUFF_FORMAT_SAFE_FLAGS:
+                    idx += 1
+                    continue
+                return False, f"disallowed_ruff_format_flag:{tok}"
+
+            elif tool_type == "mypy":
+                if tok in _MYPY_SAFE_FLAGS:
+                    idx += 1
+                    continue
+                if tok.startswith("--python-version="):
+                    val_tok = tok.split("=", 1)[1]
+                    if not re.match(r"^\d+\.\d+$", val_tok):
+                        return False, f"invalid_python_version:{tok}"
+                    idx += 1
+                    continue
+                return False, f"disallowed_mypy_flag:{tok}"
+
+            else:
+                return False, f"unknown_executable_tool_type:{tok}"
         else:
             norm = normalize_test_target(tok) or normalize_file_path(tok)
             if not norm:
                 return False, f"unrecognized_command_argument:{tok}"
+            idx += 1
 
     return True, None
 

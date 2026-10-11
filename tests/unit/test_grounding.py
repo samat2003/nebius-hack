@@ -26,8 +26,16 @@ from alienese.grounding import (
     normalize_symbol_name,
     normalize_test_target,
 )
-from alienese.grounding.eval import build_frozen_phase1_baseline
-from alienese.grounding.extractors.mutation import classify_verification_outcome
+from alienese.grounding.argument_resolution import GroundedArgumentResolver
+from alienese.grounding.eval import (
+    _canonical_token,
+    build_frozen_phase1_baseline,
+    evaluate_decision_points,
+)
+from alienese.grounding.extractors.mutation import (
+    classify_mutation_outcome,
+    classify_verification_outcome,
+)
 from alienese.grounding.normalization import is_safe_verification_command
 from alienese.providers.fake import FakeController, FakeGenerator, FakeRetriever
 
@@ -723,3 +731,233 @@ def test_phase1_baseline_evaluation_correctness() -> None:
     assert len(base_cands) == 1
     assert base_cands[0].candidate_id == "cand_answer"
     assert base_cands[0].generation_job_type == GenerationJobType.ANSWER
+
+
+def test_schema_defaults_capability_boundary_enforcement() -> None:
+    """Verifies schema defaults undergo boundary validation and cannot leak uncontained paths."""
+    # 1. Tool with dangerous Unix absolute path default
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Please read file"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read file contents",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "default": "/etc/passwd",
+                                }
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    events, tools = normalize_request(req)
+    state = reconstruct(events, available_tools=tools)
+    builder = CandidateBuilder()
+    candidates, _evi, _diag = builder.build_candidates(events, state)
+
+    # Candidate for read_file must NOT be complete with /etc/passwd
+    read_cands = [c for c in candidates if c.external_tool_name == "read_file"]
+    assert len(read_cands) == 1
+    assert read_cands[0].arguments_complete is False
+    assert "path" not in read_cands[0].arguments
+
+    # tool_choice='required' must fail closed with CompatibilityError
+    with pytest.raises(CompatibilityError) as exc_info:
+        builder.build_candidates(events, state, tool_choice="required")
+    assert exc_info.value.code == "ungrounded_required_tool_arguments"
+
+    # NamedToolChoice for read_file must fail closed
+    with pytest.raises(CompatibilityError) as exc_info:
+        builder.build_candidates(
+            events,
+            state,
+            tool_choice=NamedToolChoice(function=NamedFunctionChoice(name="read_file")),
+        )
+    assert exc_info.value.code == "ungrounded_required_tool_arguments"
+
+    # 2. Test dangerous Windows drive path and UNC path defaults
+    resolver = GroundedArgumentResolver()
+    for bad_path in (
+        "C:\\Windows\\System32\\cmd.exe",
+        "\\\\server\\share\\secret.txt",
+        "../../escape.py",
+        "file:///etc/shadow",
+    ):
+        schema = {
+            "type": "object",
+            "properties": {"path": {"type": "string", "default": bad_path}},
+            "required": ["path"],
+        }
+        binding = tools[0].model_copy(update={"parameters_schema": schema})
+        args, complete, _ = resolver.resolve_arguments(binding, (), state)
+        assert complete is False
+        assert "path" not in args
+
+    # 3. Valid contained default path is accepted and normalized
+    valid_schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string", "default": "./src/main.py"}},
+        "required": ["path"],
+    }
+    valid_binding = tools[0].model_copy(update={"parameters_schema": valid_schema})
+    args, complete, _ = resolver.resolve_arguments(valid_binding, (), state)
+    assert complete is True
+    assert args.get("path") == "src/main.py"
+
+
+def test_verification_command_safety_strict_allowlists() -> None:
+    """Verifies that verification commands enforce strict per-executable option allowlists."""
+    # Pytest safe flags
+    assert is_safe_verification_command("pytest -v -q -x -s tests/test_auth.py")[0] is True
+    assert (
+        is_safe_verification_command(
+            "pytest --disable-warnings --strict-markers -k test_login tests/test_auth.py"
+        )[0]
+        is True
+    )
+    assert (
+        is_safe_verification_command(
+            "python -m pytest -v -k 'test_login or test_logout' tests/test_auth.py"
+        )[0]
+        is True
+    )
+
+    # Pytest dangerous flags (plugin loading, config override, pdb) rejected
+    assert is_safe_verification_command("pytest -p evil_plugin tests/test_auth.py")[0] is False
+    assert (
+        is_safe_verification_command("pytest --override-ini=addopts=--evil tests/test_auth.py")[0]
+        is False
+    )
+    assert is_safe_verification_command("pytest -c /tmp/evil.ini tests/test_auth.py")[0] is False
+    assert is_safe_verification_command("pytest -o evil=1 tests/test_auth.py")[0] is False
+    assert is_safe_verification_command("pytest --pdb tests/test_auth.py")[0] is False
+    assert is_safe_verification_command("pytest --capture=sys tests/test_auth.py")[0] is False
+
+    # Unittest safe and dangerous flags
+    assert is_safe_verification_command("python -m unittest -v -f tests/test_auth.py")[0] is True
+    assert is_safe_verification_command("python -m unittest -p evil tests/test_auth.py")[0] is False
+
+    # Ruff check and format
+    assert is_safe_verification_command("ruff check src/")[0] is True
+    assert is_safe_verification_command("ruff check --exit-zero src/")[0] is True
+    assert is_safe_verification_command("ruff format --check src/")[0] is True
+    assert is_safe_verification_command("ruff check --unknown-flag src/")[0] is False
+    assert is_safe_verification_command("ruff format src/")[0] is False
+
+    # Mypy safe and dangerous flags
+    assert is_safe_verification_command("mypy --strict src/")[0] is True
+    assert (
+        is_safe_verification_command("mypy --ignore-missing-imports src/tests/test_x.py")[0] is True
+    )
+    assert is_safe_verification_command("mypy --arbitrary-flag src/")[0] is False
+
+
+def test_mutation_extractor_positive_confirmation() -> None:
+    """Proves file mutations require positive confirmation and distinguish attempts from applied."""
+    target = "src/auth/session.py"
+
+    # Empty output -> unconfirmed
+    is_conf, status = classify_mutation_outcome("", target)
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # Unrelated output -> unconfirmed
+    is_conf, status = classify_mutation_outcome("Tests completed successfully.", target)
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # Wrong file output -> unconfirmed
+    is_conf, status = classify_mutation_outcome("Successfully updated src/db/models.py", target)
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # JSON output with different file -> unconfirmed
+    is_conf, status = classify_mutation_outcome(
+        '{"status": "ok", "path": "src/db/models.py"}', target
+    )
+    assert is_conf is False
+    assert status == EvidenceStatus.OBSERVED
+
+    # Explicit failure text
+    is_conf, status = classify_mutation_outcome("Permission denied writing to " + target, target)
+    assert is_conf is False
+    assert status == EvidenceStatus.FAILED
+
+    # Explicit failure JSON
+    is_conf, status = classify_mutation_outcome('{"status": "error", "message": "locked"}', target)
+    assert is_conf is False
+    assert status == EvidenceStatus.FAILED
+
+    # Positive confirmation text
+    is_conf, status = classify_mutation_outcome("Successfully updated " + target, target)
+    assert is_conf is True
+    assert status == EvidenceStatus.CONFIRMED
+
+    is_conf, status = classify_mutation_outcome("Wrote 512 bytes to " + target, target)
+    assert is_conf is True
+    assert status == EvidenceStatus.CONFIRMED
+
+    # Positive confirmation JSON
+    is_conf, status = classify_mutation_outcome(
+        '{"status": "ok", "path": "' + target + '"}', target
+    )
+    assert is_conf is True
+    assert status == EvidenceStatus.CONFIRMED
+
+    is_conf, status = classify_mutation_outcome('{"success": true}', target)
+    assert is_conf is True
+    assert status == EvidenceStatus.CONFIRMED
+
+
+def test_eval_evidence_support_handles_unhashable_structures() -> None:
+    """Verifies eval token handling serializes objects and arrays without unhashable errors."""
+    assert _canonical_token({"key": "val"}) == '{"key":"val"}'
+    assert _canonical_token([1, 2, "three"]) == '[1,2,"three"]'
+    assert _canonical_token("simple") == "simple"
+
+    # Run evaluate_decision_points on sample with complex parameters
+    dp = {
+        "request": {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Run tool with config"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "run_configured",
+                        "description": "Run tool with object config",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "config": {
+                                    "type": "object",
+                                    "default": {"mode": "fast", "retries": 3},
+                                }
+                            },
+                        },
+                    },
+                }
+            ],
+        },
+        "oracle": {
+            "canonical_intent": "CUSTOM_TOOL",
+            "external_tool_name": "run_configured",
+            "required_arguments": {},
+            "expect_executable": True,
+        },
+    }
+    results = evaluate_decision_points([dp])
+    assert results["total"] == 1
+    assert results["unsupported_arg_count"] == 0
+    assert results["evidence_support_rate"] == 1.0

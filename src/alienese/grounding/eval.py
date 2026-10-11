@@ -58,6 +58,13 @@ def extract_schema_defaults(schema: Mapping[str, Any]) -> dict[str, Any]:
     return defaults
 
 
+def _canonical_token(val: Any) -> str:
+    """Deterministically serialize values (including dicts and lists) to safe string tokens."""
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, sort_keys=True, separators=(",", ":"))
+    return str(val)
+
+
 def build_frozen_phase1_baseline(
     state: WorkingState,
     request: ChatCompletionRequest,
@@ -216,7 +223,7 @@ def evaluate_decision_points(
     valid_executable_candidates = 0
 
     total_bound_arg_values = 0
-    fabrication_count = 0
+    unsupported_arg_count = 0
 
     builder = CandidateBuilder()
 
@@ -251,17 +258,11 @@ def evaluate_decision_points(
                 failed_closed = True
                 candidates = ()
 
-        # Collect evidence & defaults for fabrication analysis
+        # Collect evidence tokens for evidence-support proxy analysis
         all_evidence = extract_all_evidence(events, state, tools)
-        evidence_values = {e.value for e in all_evidence}
-        for ev in events:
-            if ev.content:
-                evidence_values.add(ev.content.strip())
-        schema_defaults = {
-            v for t in tools for v in extract_schema_defaults(t.parameters_schema).values()
-        }
+        evidence_tokens = {_canonical_token(e.value) for e in all_evidence}
 
-        # Check executable candidates validity and fabrication
+        # Check executable candidates validity and evidence support
         for c in candidates:
             if c.arguments_complete and c.disposition == CandidateDisposition.EXTERNAL_TOOL:
                 total_executable_candidates += 1
@@ -272,17 +273,20 @@ def evaluate_decision_points(
                     )
                     if valid:
                         valid_executable_candidates += 1
+                    tool_defaults = extract_schema_defaults(binding.parameters_schema)
+                else:
+                    tool_defaults = {}
 
-                for arg_val in c.arguments.values():
+                for arg_name, arg_val in c.arguments.items():
                     total_bound_arg_values += 1
-                    # A value is fabricated if absent from evidence values and schema defaults
-                    str_val = str(arg_val)
-                    if (
-                        str_val not in evidence_values
-                        and arg_val not in schema_defaults
-                        and not any(str_val in ev.content for ev in events if ev.content)
-                    ):
-                        fabrication_count += 1
+                    val_token = _canonical_token(arg_val)
+                    is_in_evidence = val_token in evidence_tokens
+                    is_in_tool_defaults = (
+                        arg_name in tool_defaults
+                        and _canonical_token(tool_defaults[arg_name]) == val_token
+                    )
+                    if not (is_in_evidence or is_in_tool_defaults):
+                        unsupported_arg_count += 1
 
         if not expect_exec:
             # Abstention case: expect no executable external tool
@@ -359,10 +363,16 @@ def evaluate_decision_points(
         if total_executable_candidates == 0
         else round(valid_executable_candidates / total_executable_candidates, 4),
         "total_bound_args": total_bound_arg_values,
-        "fabrication_count": fabrication_count,
+        "unsupported_arg_count": unsupported_arg_count,
+        "evidence_support_rate": round(
+            (total_bound_arg_values - unsupported_arg_count) / total_bound_arg_values, 4
+        )
+        if total_bound_arg_values > 0
+        else 1.0,
+        "fabrication_count": unsupported_arg_count,
         "fabrication_rate": 0.0
         if total_bound_arg_values == 0
-        else round(fabrication_count / total_bound_arg_values, 4),
+        else round(unsupported_arg_count / total_bound_arg_values, 4),
     }
 
 
@@ -453,10 +463,24 @@ def run_cli() -> None:
         )
         print(f"{'Executable Validity':<28} {p1_ev:<22} {p3_ev:<22} {'0.0%':<10}")
 
-        # Fabrication Count
-        p1_fab = f"{p1['fabrication_count']}/{p1['total_bound_args']}"
-        p3_fab = f"{p3['fabrication_count']}/{p3['total_bound_args']}"
-        print(f"{'Fabrication Count':<28} {p1_fab:<22} {p3_fab:<22} {'0':<10}")
+        # Evidence Support (Proxy)
+        p1_sup = format_rate(
+            p1["total_bound_args"] - p1["unsupported_arg_count"],
+            p1["total_bound_args"],
+            p1["evidence_support_rate"],
+        )
+        p3_sup = format_rate(
+            p3["total_bound_args"] - p3["unsupported_arg_count"],
+            p3["total_bound_args"],
+            p3["evidence_support_rate"],
+        )
+        sup_lift = f"{p3['evidence_support_rate'] - p1['evidence_support_rate']:+.1%}"
+        print(f"{'Evidence Support (Proxy)':<28} {p1_sup:<22} {p3_sup:<22} {sup_lift:<10}")
+
+        # Unsupported Arg Count
+        p1_un = f"{p1['unsupported_arg_count']}/{p1['total_bound_args']}"
+        p3_un = f"{p3['unsupported_arg_count']}/{p3['total_bound_args']}"
+        print(f"{'Unsupported Arg Count':<28} {p1_un:<22} {p3_un:<22} {'0':<10}")
         print()
 
 
