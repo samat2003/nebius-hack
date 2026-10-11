@@ -39,6 +39,11 @@ packages = ["src/alienese"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+exclude = [
+    ".git",
+    ".venv",
+    "scripts",
+]
 
 [tool.ruff.lint]
 select = [
