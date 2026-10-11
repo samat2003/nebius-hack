@@ -1,15 +1,14 @@
-"""Honest, reproducible comparative evaluation script.
+"""One-turn tool-argument safety evaluation script.
 
 Compares:
 1. Baseline Raw Nemotron: Unconstrained remote LLM directly invoked with tools.
-2. Alienese + Nebius: Deterministic evidence grounding, candidate construction,
-   and safety guardrails intervening before model decision.
+2. Alienese + Nebius: Deterministic evidence grounding and schema boundary containment
+   intervening before model decision.
 
-Evaluates:
-- Hallucinated / Out-of-bounds path rate
-- Arbitrary command injection rate
-- Valid grounded tool call rate
-- Token consumption and efficiency
+Note: This is a focused 5-case one-turn tool-argument safety evaluation assessing
+out-of-workspace path proposals and unsupported targets, NOT an end-to-end coding benchmark.
+Alienese's deterministic candidate grounding may select high-confidence local actions
+directly without remote model inference.
 """
 
 from __future__ import annotations

@@ -120,10 +120,13 @@ RUN_LIVE_NVIDIA_TESTS=1 pytest -m live_nvidia -v
 # Optional: run bounded live Nebius Token Factory integration test (requires NEBIUS_TOKEN_FACTORY_KEY in .env)
 RUN_LIVE_NEBIUS_TESTS=1 pytest -m live_nebius -v
 
-# Run the live autonomous coding repair workflow on Nebius Token Factory
+# Run the one-command offline autonomous coding repair demo (no API keys needed)
+python scripts/run_coding_task.py
+
+# Run the live autonomous coding repair workflow on Nebius Token Factory (requires NEBIUS_TOKEN_FACTORY_KEY in .env)
 python scripts/run_coding_task.py --live
 
-# Run the head-to-head comparative benchmark (Raw Nemotron vs. Alienese)
+# Run the one-turn tool-argument safety evaluation (Raw Nemotron vs. Alienese)
 python scripts/run_comparative_benchmark.py
 
 # Start the development server in fake-provider mode (default)
