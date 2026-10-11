@@ -83,4 +83,5 @@ markers = [
     "live_nebius: Opt-in live Nebius Token Factory integration tests (requires RUN_LIVE_NEBIUS_TESTS=1)",
 ]
 addopts = "-ra -q --strict-markers -m 'not live_nvidia and not live_nebius'"
+pythonpath = [".", "src"]
 

@@ -1,4 +1,4 @@
-# Alienese — Video Screencast & Demo Script (2:50 Target)
+# Alienese — Video Screencast & Demo Script (2:45 Target)
 
 ## Overview & Timing Budget
 - Total Target Duration: **2 minutes 45 seconds** (Strictly under 3:00 Devpost limit)
@@ -11,11 +11,11 @@
 **[Visual: Split screen showing standard LLM coding agent terminal spinning into chaos with hallucinated file paths and unbounded bash calls.]**
 
 > "Autonomous coding agents are revolutionizing software development. But when you connect frontier reasoning models directly to coding tools, they frequently fail in production in predictable ways:
-> 1. They hallucinate non-existent files when investigating bugs.
+> 1. They hallucinate non-existent files or directories when investigating ambiguous bugs.
 > 2. They attempt out-of-bounds file system traversals like `/etc/passwd`.
 > 3. And they lack deterministic provenance or replayability when things go wrong.
 >
-> We don't need larger monolithic models to fix this. We need an intelligent inference gateway that enforces strict reliability and safety invariants."
+> We don't need larger monolithic models to fix this. We need an intelligent inference gateway that enforces strict reliability and safety invariants before requests hit the model."
 
 ---
 
@@ -33,29 +33,30 @@
 ---
 
 ## Part 3: Live End-to-End Autonomous Repair Demo (1:15 - 2:05)
-**[Visual: Terminal running `python scripts/run_coding_task.py --live` with rich logs and passing tests.]**
+**[Visual: Terminal running `python scripts/run_coding_task.py --live` with authentic logs, diff, and passing tests.]**
 
 > "Let's see Alienese in action live on Nebius Token Factory.
 >
 > Here we run an authentic token expiry bug:
 > - Step 1: The initial pytest run fails with an `AssertionError: Freshly issued token must be valid`.
-> - Step 2: The error trace enters Alienese. Instead of hallucinating paths, Alienese grounds the failure directly to `tests/test_token.py` and proposes a grounded `read_file` action.
-> - Step 3: Alienese inspects the source, verifies the fix in `auth/token.py`, and re-runs pytest.
-> - Step 4: The tests turn green in 0.00s!
-> - Step 5: Nebius Token Factory generates a crisp 2-sentence post-mortem explanation: *'The issue was that TokenManager incorrectly stored the issued time with a past offset... We corrected it to record the actual issuance time.'*
+> - Step 2: The error trace enters Alienese. Instead of hallucinating paths, Alienese deterministically grounds the failure to `tests/test_token.py` and proposes a grounded `read_file` action.
+> - Step 3: Alienese feeds the failing test, grounded path, and source code to NVIDIA Nemotron 3 Super on Nebius Token Factory. Nemotron synthesizes the corrected Python implementation of `auth/token.py`.
+> - Step 4: The model-generated patch is validated and applied to our sandboxed workspace.
+> - Step 5: Both the target unit test and an independent acceptance check pass cleanly!
+> - Step 6: Nebius Token Factory generates a concise post-mortem explanation of the fix.
 >
-> The entire multi-turn autonomous repair completes in just 1047 milliseconds."
+> The entire multi-turn autonomous repair completes end-to-end in just 1.7 seconds."
 
 ---
 
 ## Part 4: Comparative Evaluation & Impact (2:05 - 2:35)
-**[Visual: Displaying the head-to-head benchmark table from `results/benchmark_report.md`.]**
+**[Visual: Displaying the safety evaluation table from `results/benchmark_report.md`.]**
 
-> "We ran a head-to-head benchmark comparing unconstrained Raw Nemotron against Alienese on Nebius Token Factory:
-> - **Path Traversal & Escapes:** Raw Nemotron attempted reading `/etc/passwd` when prompted maliciously. Alienese blocked 100% of out-of-bounds traversals.
-> - **Hallucinated Arguments:** Raw Nemotron invented non-existent directory paths on ambiguous queries. Alienese eliminated 100% of hallucinations, safely degrading to assistant clarifications.
-> - **Candidate Recall:** On our 35-point golden evaluation dataset, Alienese achieved **88.9% Recall@1** on held-out test splits, a **+55.6% lift** over baseline ungrounded systems.
-> - **100% Replayability:** Every decision produces a cryptographically verified ReplayArtifact with provenance tracking."
+> "We evaluated unconstrained Raw Nemotron against Alienese on Nebius Token Factory across targeted safety scenarios:
+> - **Out-of-Workspace Path Proposals:** Raw Nemotron proposed reading `/etc/passwd` when prompted maliciously. Alienese blocked 100% of out-of-bounds traversals.
+> - **Unsupported Target Proposals:** Raw Nemotron proposed reading a directory `src/auth/` on ambiguous queries. Alienese eliminated 100% of hallucinations, safely degrading to assistant clarifications.
+> - **Candidate Recall:** On our separate 35-point golden evaluation dataset, Alienese achieved **88.9% Recall@1** on held-out test splits, a **+55.6% lift** over baseline ungrounded systems.
+> - **State Provenance:** Every turn decision produces a ReplayArtifact with SHA-256 provenance tracking."
 
 ---
 
@@ -64,4 +65,4 @@
 
 > "Alienese proves that separating deterministic evidence grounding from remote model generation makes coding agents dramatically more reliable, safe, and cost-effective.
 >
-> The code, benchmark datasets, and full replay traces are completely open source on GitHub. Thank you to Nebius and the hackathon team!"
+> The code, benchmark datasets, and full replay traces are completely open source on GitHub under the MIT License. Thank you to Nebius and the hackathon team!"
