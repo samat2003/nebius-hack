@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import pytest
 
-from alienese.api.errors import CompatibilityError
-from alienese.api.models import ChatCompletionRequest
+from alienese.api.errors import CompatibilityError, InvariantViolation
+from alienese.api.models import ChatCompletionRequest, NamedFunctionChoice, NamedToolChoice
 from alienese.contracts.candidates import (
+    CandidateAction,
     CandidateDisposition,
 )
 from alienese.contracts.context import RequestContext
 from alienese.contracts.events import SourceRole, TrustLevel
+from alienese.contracts.generation import GenerationJobType
+from alienese.contracts.state import CanonicalCapability
 from alienese.engine.normalize import normalize_request
 from alienese.engine.reconstruct import reconstruct
 from alienese.engine.turn import TurnEngine
@@ -23,6 +26,9 @@ from alienese.grounding import (
     normalize_symbol_name,
     normalize_test_target,
 )
+from alienese.grounding.eval import build_frozen_phase1_baseline
+from alienese.grounding.extractors.mutation import classify_verification_outcome
+from alienese.grounding.normalization import is_safe_verification_command
 from alienese.providers.fake import FakeController, FakeGenerator, FakeRetriever
 
 
@@ -439,3 +445,281 @@ async def test_end_to_end_turn_engine_grounding_integration() -> None:
     assert any(
         cd.external_tool_name == "run_test" and cd.arguments_complete is True for cd in c_digests
     )
+
+
+def test_path_containment_regression_rejects_out_of_workspace_paths() -> None:
+    """Direct regression proving out-of-workspace paths cannot become executable candidates."""
+    # Test normalization rejection directly
+    assert normalize_file_path("/etc/passwd") is None
+    assert normalize_file_path("/root/.ssh/id_rsa") is None
+    assert normalize_file_path("C:\\Windows\\System32\\drivers\\etc\\hosts") is None
+    assert normalize_file_path("C:/Windows/System32/cmd.exe") is None
+    assert normalize_file_path("D:relative_path.py") is None
+    assert normalize_file_path("\\\\server\\share\\exploit.py") is None
+    assert normalize_file_path("//server/share/exploit.py") is None
+    assert normalize_file_path("file:///etc/passwd") is None
+    assert normalize_file_path("http://evil.com/patch.diff") is None
+    assert normalize_file_path("../../outside.py") is None
+    assert normalize_file_path("foo/../../outside.py") is None
+
+    # Test malformed test targets
+    assert normalize_test_target("tests/test_x.py::::test_y") is None
+    assert normalize_test_target("tests/test_x.py::") is None
+    assert normalize_test_target("tests/test_x.py::test_y; rm -rf /") is None
+    assert normalize_test_target("/etc/passwd::test_root") is None
+
+    # Build candidates with adversarial prompts containing these paths
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Please inspect /etc/passwd, C:\\Windows\\System32\\cmd.exe, "
+                        "and \\\\server\\share\\leak.txt"
+                    ),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                },
+            ],
+        }
+    )
+    events, tools = normalize_request(req)
+    state = reconstruct(events, available_tools=tools)
+    builder = CandidateBuilder()
+    candidates, _evidence, _diag = builder.build_candidates(events, state)
+
+    # Prove no complete READ_FILE or WRITE_FILE candidates with out-of-workspace paths exist
+    for cand in candidates:
+        if cand.disposition == CandidateDisposition.EXTERNAL_TOOL:
+            assert cand.arguments_complete is False or cand.arguments.get("path") not in (
+                "/etc/passwd",
+                "etc/passwd",
+                "C:\\Windows\\System32\\cmd.exe",
+                "C:/Windows/System32/cmd.exe",
+                "\\\\server\\share\\leak.txt",
+            )
+
+
+def test_command_safety_regression_rejects_adversarial_invocations() -> None:
+    """Proves adversarial commands (chaining, pipes, substitutions) are rejected."""
+    # Test is_safe_verification_command directly
+    assert is_safe_verification_command("pytest tests/test_auth.py")[0] is True
+    assert is_safe_verification_command("python -m pytest tests/test_auth.py -v")[0] is True
+    assert is_safe_verification_command("python -m unittest tests/test_auth.py")[0] is True
+    assert is_safe_verification_command("ruff check src/")[0] is True
+    assert is_safe_verification_command("mypy src/")[0] is True
+
+    # Malicious chaining / appending
+    assert is_safe_verification_command("pytest tests/test_foo.py && rm -rf /")[0] is False
+    assert is_safe_verification_command("pytest tests/test_foo.py; curl -s evil.com")[0] is False
+    assert is_safe_verification_command("pytest tests/test_foo.py || echo fail")[0] is False
+    assert is_safe_verification_command("pytest | sh")[0] is False
+    assert is_safe_verification_command("pytest > /tmp/out.txt")[0] is False
+    assert is_safe_verification_command("pytest $(whoami)")[0] is False
+    assert is_safe_verification_command("pytest `id`")[0] is False
+    assert is_safe_verification_command("rm -rf /")[0] is False
+    assert is_safe_verification_command("bash -c 'echo hacked'")[0] is False
+
+    # Historical tool call containing chained malicious command
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [
+                {"role": "user", "content": "Run tests please"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "run_command",
+                                "arguments": '{"command":"pytest tests/test_x.py && rm -rf /"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "Command failed"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "run_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    events, tools = normalize_request(req)
+    state = reconstruct(events, available_tools=tools)
+    builder = CandidateBuilder()
+    candidates, _evidence, _diag = builder.build_candidates(events, state)
+
+    # Malicious chained command must NEVER become a complete candidate
+    for cand in candidates:
+        if cand.external_tool_name == "run_command":
+            cmd = cand.arguments.get("command", "")
+            assert "rm -rf" not in cmd
+            assert cand.arguments_complete is False
+
+
+def test_verification_outcome_classifier_regression() -> None:
+    """Verifies bounded explicit outcome classifier handles empty, partial, and summary outputs."""
+    # Empty output -> UNKNOWN
+    val, status = classify_verification_outcome("")
+    assert val == "UNKNOWN"
+    assert status == EvidenceStatus.INFERRED
+
+    val, status = classify_verification_outcome("   \n\t  ")
+    assert val == "UNKNOWN"
+    assert status == EvidenceStatus.INFERRED
+
+    # Zero tests collected -> UNKNOWN
+    val, status = classify_verification_outcome("collected 0 items\nno tests ran")
+    assert val == "UNKNOWN"
+    assert status == EvidenceStatus.INFERRED
+
+    # Interrupted -> UNKNOWN
+    val, status = classify_verification_outcome("KeyboardInterrupt during test run")
+    assert val == "UNKNOWN"
+    assert status == EvidenceStatus.INFERRED
+
+    # Partial / arbitrary text without summary -> UNKNOWN
+    val, status = classify_verification_outcome("Running test suite on host worker-01...")
+    assert val == "UNKNOWN"
+    assert status == EvidenceStatus.INFERRED
+
+    # Non-zero exit status -> FAILED
+    val, status = classify_verification_outcome("Tests finished with exit status 1")
+    assert val == "FAILED"
+    assert status == EvidenceStatus.FAILED
+
+    val, status = classify_verification_outcome("Some text", exit_code=2)
+    assert val == "FAILED"
+    assert status == EvidenceStatus.FAILED
+
+    # Pytest failure summary -> FAILED
+    val, status = classify_verification_outcome("=== 1 failed, 2 passed in 0.12s ===")
+    assert val == "FAILED"
+    assert status == EvidenceStatus.FAILED
+
+    val, status = classify_verification_outcome(
+        "FAILED tests/test_calc.py::test_add - AssertionError"
+    )
+    assert val == "FAILED"
+    assert status == EvidenceStatus.FAILED
+
+    # Recognized passed summary -> PASSED / CONFIRMED
+    val, status = classify_verification_outcome("=== 5 passed in 0.42s ===")
+    assert val == "PASSED"
+    assert status == EvidenceStatus.CONFIRMED
+
+    val, status = classify_verification_outcome("=== 12 passed, 2 warnings in 1.15s ===")
+    assert val == "PASSED"
+    assert status == EvidenceStatus.CONFIRMED
+
+    val, status = classify_verification_outcome("Ran 4 tests in 0.05s\n\nOK")
+    assert val == "PASSED"
+    assert status == EvidenceStatus.CONFIRMED
+
+
+def test_tool_choice_eligibility_before_candidate_truncation() -> None:
+    """Proves eligibility is enforced before truncation and named tool survives low global rank."""
+    # Validate max_k >= 1
+    with pytest.raises(ValueError, match="max_k must be at least 1"):
+        CandidateBuilder(max_k=0)
+
+    # Create 11 tools, where tool_11 is explicitly requested via NamedToolChoice
+    tools_def = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{i}",
+                "description": f"Tool number {i}",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"arg": {"type": "string", "default": f"val_{i}"}},
+                },
+            },
+        }
+        for i in range(1, 12)  # 11 tools
+    ]
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Execute tool_11 explicitly"}],
+            "tools": tools_def,
+            "tool_choice": NamedToolChoice(function=NamedFunctionChoice(name="tool_11")),
+        }
+    )
+    events, tools = normalize_request(req)
+    state = reconstruct(events, available_tools=tools)
+
+    # Builder with max_k=8
+    builder = CandidateBuilder(max_k=8)
+    cands, _evi, _diag = builder.build_candidates(events, state, tool_choice=req.tool_choice)
+
+    # Must contain tool_11 candidate, not be truncated by the 10 other tools
+    assert len(cands) == 1
+    assert cands[0].external_tool_name == "tool_11"
+    assert cands[0].arguments_complete is True
+
+
+def test_phase1_baseline_evaluation_correctness() -> None:
+    """Verifies baseline candidate generation produces valid candidates with GenerationJobType."""
+    # Reproduce that omitting generation_job_type fails CandidateAction invariant validation
+    with pytest.raises(InvariantViolation, match="generation_job_type"):
+        CandidateAction(
+            candidate_id="cand_answer",
+            canonical_intent=CanonicalCapability.RESPOND,
+            disposition=CandidateDisposition.GENERATION_JOB,
+            requires_generation=True,
+            # generation_job_type omitted!
+        )
+
+    # Verify frozen baseline produces valid candidate with generation_job_type
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "alienese-default",
+            "messages": [{"role": "user", "content": "Hello world"}],
+        }
+    )
+    events, tools = normalize_request(req)
+    state = reconstruct(events, available_tools=tools)
+    base_cands = build_frozen_phase1_baseline(state, req)
+    assert len(base_cands) == 1
+    assert base_cands[0].candidate_id == "cand_answer"
+    assert base_cands[0].generation_job_type == GenerationJobType.ANSWER

@@ -17,7 +17,7 @@ from alienese.grounding.extractors.base import (
     MAX_CHARS_PER_OBSERVATION,
     MAX_EVENTS_SCANNED,
 )
-from alienese.grounding.normalization import normalize_test_target
+from alienese.grounding.normalization import is_safe_verification_command, normalize_test_target
 
 _PYTEST_FAILED_LINE_RE = re.compile(
     r"(?:FAILED|ERROR)\s+([a-zA-Z0-9_\-\./]+::[a-zA-Z0-9_\-\.\[\]:]+)(?:\s+-\s+(.+))?"
@@ -148,29 +148,31 @@ class TestExtractor:
                         )
                     )
 
-            # 4. Explicit observed test commands
+            # 4. Explicit observed test commands (strictly validated)
             for match in _PYTEST_COMMAND_RE.finditer(bounded_content):
                 raw_cmd = match.group(1).strip()
-                if raw_cmd and len(raw_cmd) <= 512:
-                    results.append(
-                        GroundingEvidence(
-                            evidence_id=deterministic_evidence_id(
-                                EvidenceCategory.TEST_COMMAND,
-                                raw_cmd,
-                                ev.provenance,
-                                ev.sequence_no,
-                                sub_id="pytest_cmd",
-                            ),
-                            category=EvidenceCategory.TEST_COMMAND,
-                            value=raw_cmd,
-                            source_provenance=ev.provenance,
-                            trust=ev.trust,
-                            sequence_no=ev.sequence_no,
-                            is_direct=True,
-                            status=EvidenceStatus.OBSERVED,
-                            tool_call_id=ev.tool_call_id,
+                if raw_cmd:
+                    is_safe, _ = is_safe_verification_command(raw_cmd)
+                    if is_safe:
+                        results.append(
+                            GroundingEvidence(
+                                evidence_id=deterministic_evidence_id(
+                                    EvidenceCategory.TEST_COMMAND,
+                                    raw_cmd,
+                                    ev.provenance,
+                                    ev.sequence_no,
+                                    sub_id="pytest_cmd",
+                                ),
+                                category=EvidenceCategory.TEST_COMMAND,
+                                value=raw_cmd,
+                                source_provenance=ev.provenance,
+                                trust=ev.trust,
+                                sequence_no=ev.sequence_no,
+                                is_direct=True,
+                                status=EvidenceStatus.OBSERVED,
+                                tool_call_id=ev.tool_call_id,
+                            )
                         )
-                    )
 
             # 5. Check tool calls for run_test arguments
             if ev.kind == EventKind.TOOL_CALL and ev.tool_arguments:

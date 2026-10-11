@@ -70,6 +70,8 @@ class CandidateBuilder:
         resolver: GroundedArgumentResolver | None = None,
         max_k: int = DEFAULT_MAX_CANDIDATES,
     ) -> None:
+        if max_k < 1:
+            raise ValueError(f"max_k must be at least 1, got {max_k}")
         self._resolver = resolver or GroundedArgumentResolver()
         self._max_k = max_k
 
@@ -82,16 +84,15 @@ class CandidateBuilder:
         """Construct, ground, rank, and bound candidates deterministically."""
         evidence_items = extract_all_evidence(events, state, state.available_tools)
 
-        # Count evidence categories
         category_counts: dict[str, int] = {}
         for evi in evidence_items:
             category_counts[evi.category.value] = category_counts.get(evi.category.value, 0) + 1
 
         raw_candidates: list[CandidateAction] = []
-        seen_cand_ids: set[str] = set()
-        seen_actions: set[tuple[str, str]] = set()
+        candidates_by_sig: dict[tuple[str, str], CandidateAction] = {}
         dedup_count = 0
         rejected_incomplete = 0
+        abstention_reasons: list[str] = []
 
         # Always prepare standard assistant response candidate
         answer_cand = CandidateAction(
@@ -115,31 +116,27 @@ class CandidateBuilder:
                 state,
                 primary_evidence=None,
             )
-            cand_id = f"cand_tool_{binding.external_name}"
+            # Use canonical cand_tool_{name} for schema-default base candidates
+            base_cand_id = f"cand_tool_{binding.external_name}"
             action_sig = (
                 binding.external_name,
                 json.dumps(def_args, sort_keys=True, separators=(",", ":")),
             )
-            if cand_id not in seen_cand_ids and action_sig not in seen_actions:
-                seen_cand_ids.add(cand_id)
-                seen_actions.add(action_sig)
-                raw_candidates.append(
-                    CandidateAction(
-                        candidate_id=cand_id,
-                        canonical_intent=binding.canonical_capability,
-                        disposition=CandidateDisposition.EXTERNAL_TOOL,
-                        external_tool_name=binding.external_name,
-                        arguments=def_args,
-                        arguments_complete=def_complete,
-                        evidence_refs=tuple(e.source_provenance for e in def_evi),
-                        requires_generation=False,
-                        risk_class=tool_risk,
-                        cost_class=CostClass.LOW,
-                        rationale=f"Candidate for external tool '{binding.external_name}'.",
-                    )
-                )
-            else:
-                dedup_count += 1
+            base_action = CandidateAction(
+                candidate_id=base_cand_id,
+                canonical_intent=binding.canonical_capability,
+                disposition=CandidateDisposition.EXTERNAL_TOOL,
+                external_tool_name=binding.external_name,
+                arguments=def_args,
+                arguments_complete=def_complete,
+                evidence_refs=tuple(e.source_provenance for e in def_evi),
+                requires_generation=False,
+                risk_class=tool_risk,
+                cost_class=CostClass.LOW,
+                rationale=f"Candidate for external tool '{binding.external_name}'.",
+            )
+            candidates_by_sig[action_sig] = base_action
+            raw_candidates.append(base_action)
 
             # 2. Targeted resolution for each relevant evidence item
             for evi in evidence_items:
@@ -194,58 +191,73 @@ class CandidateBuilder:
                     binding.external_name,
                     json.dumps(args, sort_keys=True, separators=(",", ":")),
                 )
-                if action_sig in seen_actions:
+                if action_sig in candidates_by_sig:
+                    # Deduplicate while preserving merged evidence provenance
+                    existing = candidates_by_sig[action_sig]
+                    existing_refs = set(existing.evidence_refs)
+                    new_refs = {e.source_provenance for e in bound_evi}
+                    combined_refs = tuple(sorted(existing_refs.union(new_refs), key=str))
+                    # Update existing candidate with merged evidence refs
+                    updated = existing.model_copy(update={"evidence_refs": combined_refs})
+                    candidates_by_sig[action_sig] = updated
+                    # Replace in raw_candidates list
+                    for idx, c in enumerate(raw_candidates):
+                        if c.candidate_id == existing.candidate_id:
+                            raw_candidates[idx] = updated
+                            break
                     dedup_count += 1
                     continue
 
+                # Grounded candidate with bound evidence gets content-addressed ID
                 cand_id = deterministic_candidate_id(
                     binding.external_name,
                     binding.canonical_capability,
                     args,
                 )
-                if cand_id not in seen_cand_ids:
-                    seen_cand_ids.add(cand_id)
-                    seen_actions.add(action_sig)
-                    raw_candidates.append(
-                        CandidateAction(
-                            candidate_id=cand_id,
-                            canonical_intent=binding.canonical_capability,
-                            disposition=CandidateDisposition.EXTERNAL_TOOL,
-                            external_tool_name=binding.external_name,
-                            arguments=args,
-                            arguments_complete=is_complete,
-                            evidence_refs=tuple(e.source_provenance for e in bound_evi),
-                            requires_generation=False,
-                            risk_class=tool_risk,
-                            cost_class=CostClass.LOW,
-                            rationale=(
-                                f"Grounded candidate for tool '{binding.external_name}' "
-                                f"bound to {evi.category.value} '{evi.value}'."
-                            ),
-                        )
-                    )
-                else:
-                    dedup_count += 1
+                grounded_cand = CandidateAction(
+                    candidate_id=cand_id,
+                    canonical_intent=binding.canonical_capability,
+                    disposition=CandidateDisposition.EXTERNAL_TOOL,
+                    external_tool_name=binding.external_name,
+                    arguments=args,
+                    arguments_complete=is_complete,
+                    evidence_refs=tuple(e.source_provenance for e in bound_evi),
+                    requires_generation=False,
+                    risk_class=tool_risk,
+                    cost_class=CostClass.LOW,
+                    rationale=(
+                        f"Grounded candidate for tool '{binding.external_name}' "
+                        f"bound to {evi.category.value} '{evi.value}'."
+                    ),
+                )
+                candidates_by_sig[action_sig] = grounded_cand
+                raw_candidates.append(grounded_cand)
 
         raw_candidates.append(answer_cand)
         raw_count = len(raw_candidates)
 
-        # Rank and bound candidates
+        # 3. Apply tool_choice eligibility FIRST before truncation
+        try:
+            eligible_candidates = enforce_tool_choice_policy(
+                raw_candidates,
+                tool_choice=tool_choice,
+                available_tools=state.available_tools,
+            )
+        except Exception as exc:
+            # Capture abstention reason for diagnostics and re-raise
+            abstention_reasons.append(str(exc))
+            raise
+
+        # 4. Rank and bound within the eligible candidate set
         user_request = state.latest_user_request or state.initial_user_request
-        ranked = rank_and_bound_candidates(
-            raw_candidates,
+        preserve_answer = tool_choice in ("auto", None)
+        final_candidates = rank_and_bound_candidates(
+            eligible_candidates,
             state,
             evidence_items,
             user_request=user_request,
             max_k=self._max_k,
-            preserve_answer=True,
-        )
-
-        # Apply tool_choice policy
-        final_candidates = enforce_tool_choice_policy(
-            ranked,
-            tool_choice=tool_choice,
-            available_tools=state.available_tools,
+            preserve_answer=preserve_answer,
         )
 
         executable_count = sum(1 for c in final_candidates if c.arguments_complete)
@@ -258,6 +270,7 @@ class CandidateBuilder:
             final_candidates_count=len(final_candidates),
             deduplicated_candidates_count=dedup_count,
             rejected_incomplete_count=rejected_incomplete,
+            abstention_reasons=tuple(abstention_reasons),
         )
 
         return final_candidates, evidence_items, diagnostics

@@ -268,5 +268,35 @@ Offline deterministic test suite in `tests/unit/test_grounding.py` and `tests/co
 5. **Step 5: TurnEngine Integration & Compatibility Bridge** (`src/alienese/engine/turn.py`).
 6. **Step 6: Golden Evaluation Dataset & CLI Harness** (`tests/fixtures/grounding/`, `src/alienese/grounding/eval.py`).
 7. **Step 7: Comprehensive Unit & Regression Test Suite** (`tests/unit/test_grounding.py`).
-8. **Step 8: Baseline vs. Phase 3 Evaluation Execution & Documentation Updates** (`README.md`, `docs/ARCHITECTURE.md`, `docs/PLAN.md`).
-9. **Step 9: Lint, Typecheck, Test, Gitleaks, Commit, and PR Creation**.
+---
+
+## 11. Review Corrections and Final Evaluation
+
+Following independent code review of PR #4, the grounding subsystem addressed five critical correctness gates:
+1. **Repository Path Containment**: Rejects Unix absolute (`/etc/passwd`), Windows drive paths (`C:\...`, `D:...`), UNC paths (`\\...`, `//...`), URI forms (`file://...`), traversal escapes (`../`), and malformed test node IDs. File listings in tool output are only recognized when the originating tool call was explicitly a listing/directory tool, with status `OBSERVED`.
+2. **Command Grounding Security**: Narrows command execution to recognized verification commands (`pytest`, `python -m unittest`, `ruff`, `mypy`). Rejects shell chaining (`&&`, `;`, `||`), pipelines (`|`), redirections (`>`, `<`), substitutions (`$()`), and destructive commands (`rm`, `curl`, `sh`, `bash`).
+3. **Explicit Verification Outcomes**: Implemented bounded outcome classifier: `PASSED` (only explicit recognized test reports produce `CONFIRMED`), `FAILED` (explicit test failure/error or non-zero exit), and `UNKNOWN` (empty, 0 tests collected, interrupted, partial output).
+4. **Tool-Choice Eligibility Before Truncation**: Enforces candidate eligibility for named-tool, `required`, and `none` modes before applying the $K=8$ candidate limit (`max_k >= 1` enforced), preventing named tools from being truncated by other tools.
+5. **Evaluation Correctness & Faithfulness**: Fixed baseline CandidateAction initialization (`generation_job_type=GenerationJobType.ANSWER`). Separated positive-action selection from abstention correctness. Revalidates all candidates against actual JSON schemas and reports explicit denominators and exact fabrication counts (checking evidence set and schema defaults).
+
+### Measured Evaluation Results (Golden Corpus N=35)
+
+| Split | Metric | Phase 1 Baseline | Phase 3 Grounded Engine | Lift |
+| :--- | :--- | :--- | :--- | :--- |
+| **TEST (Held-Out, N=10)** | **Oracle Recall@1** | 3/9 (33.3%) | **8/9 (88.9%)** | **+55.6%** |
+| *(Action N=9, Abstain N=1)* | **Oracle Recall@4** | 3/9 (33.3%) | **8/9 (88.9%)** | **+55.6%** |
+| | **Oracle Recall@8** | 3/9 (33.3%) | **8/9 (88.9%)** | **+55.6%** |
+| | **Exact Arg Accuracy** | 3/9 (33.3%) | **8/9 (88.9%)** | **+55.6%** |
+| | **Arg Presence Rate** | 2/8 (25.0%) | **8/8 (100.0%)** | **+75.0%** |
+| | **Abstention Correctness** | 1/1 (100.0%) | **1/1 (100.0%)** | +0.0% |
+| | **Executable Validity Rate**| 2/2 (100.0%) | **10/10 (100.0%)** | 0.0% |
+| | **Fabrication Count** | 0/2 | **0/10** | 0 |
+| **ALL COMBINED (N=35)** | **Oracle Recall@1** | 6/29 (20.7%) | **23/29 (79.3%)** | **+58.6%** |
+| *(Action N=29, Abstain N=6)*| **Oracle Recall@4** | 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
+| | **Oracle Recall@8** | 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
+| | **Exact Arg Accuracy** | 8/29 (27.6%) | **24/29 (82.8%)** | **+55.2%** |
+| | **Arg Presence Rate** | 6/25 (24.0%) | **23/26 (88.5%)** | **+64.5%** |
+| | **Abstention Correctness** | 6/6 (100.0%) | **6/6 (100.0%)** | +0.0% |
+| | **Executable Validity Rate**| 6/6 (100.0%) | **28/28 (100.0%)** | 0.0% |
+| | **Fabrication Count** | 0/6 | **0/28** | 0 |
+

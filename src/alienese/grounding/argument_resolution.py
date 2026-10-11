@@ -21,6 +21,7 @@ from alienese.engine.turn import (
     validate_tool_arguments_against_schema,
 )
 from alienese.grounding.evidence import EvidenceCategory, GroundingEvidence
+from alienese.grounding.normalization import is_safe_verification_command
 
 _PATH_PROPERTY_NAMES: tuple[str, ...] = (
     "path",
@@ -161,6 +162,18 @@ class GroundedArgumentResolver:
         is_valid, _reason = validate_tool_arguments_against_schema(schema, arguments)
         is_complete = is_valid and required_props.issubset(arguments.keys())
 
+        # For RUN_COMMAND, ensure command argument is a recognized safe verification command
+        if capability == CanonicalCapability.RUN_COMMAND:
+            for cmd_key in _COMMAND_PROPERTY_NAMES:
+                if cmd_key in arguments:
+                    cmd_val = arguments[cmd_key]
+                    if isinstance(cmd_val, str):
+                        is_safe, _ = is_safe_verification_command(cmd_val)
+                        if not is_safe:
+                            is_complete = False
+                    else:
+                        is_complete = False
+
         # High risk mutations (APPLY_PATCH, WRITE_FILE) must not be executable
         # if patch or content was fabricated or missing
         if capability in (CanonicalCapability.APPLY_PATCH, CanonicalCapability.WRITE_FILE):
@@ -281,14 +294,18 @@ class GroundedArgumentResolver:
         if not target_prop or target_prop in arguments:
             return
 
-        # Only ground exact observed TEST_COMMAND
+        # Only ground recognized safe verification commands
         if primary_evidence and primary_evidence.category == EvidenceCategory.TEST_COMMAND:
-            arguments[target_prop] = primary_evidence.value
-            bound_evidence.append(primary_evidence)
-            return
+            is_safe, _ = is_safe_verification_command(primary_evidence.value)
+            if is_safe:
+                arguments[target_prop] = primary_evidence.value
+                bound_evidence.append(primary_evidence)
+                return
 
         for evi in evidence_items:
             if evi.category == EvidenceCategory.TEST_COMMAND:
-                arguments[target_prop] = evi.value
-                bound_evidence.append(evi)
-                return
+                is_safe, _ = is_safe_verification_command(evi.value)
+                if is_safe:
+                    arguments[target_prop] = evi.value
+                    bound_evidence.append(evi)
+                    return

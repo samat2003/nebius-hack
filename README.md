@@ -84,14 +84,16 @@ Phase 0, Phase 1, Phase 2, and Phase 3 implemented:
   - truthful nullable token and cost telemetry (`ProviderCallTelemetry` and `ChatCompletionResponse.usage`).
 - **Phase 3 Deterministic Grounding and Candidate Construction (Completed)**:
   - deterministic typed evidence extraction (`GroundingEvidence`: file paths, symbols, test targets/commands, search patterns, stack frames, failure messages, exit statuses, mutation targets, verification results);
-  - strict 4-tier trust boundaries (`SYSTEM_PROMPT` > `USER_DIRECTIVE` > `AGENT_COMMITTED` > `UNTRUSTED_EXTERNAL`) preventing untrusted tool results from hijacking policy or fabricating tool arguments;
+  - strict repository path containment rejecting out-of-workspace, Windows drive, UNC, URI, and traversal escape paths;
+  - safe command grounding validating verification executables (`pytest`, `python -m unittest`, `ruff`, `mypy`) and rejecting arbitrary shell pipelines, chaining, redirection, or destructive commands;
+  - explicit verification outcome classifier (`PASSED` [positive confirmation only], `FAILED`, `UNKNOWN`);
+  - strict 4-tier trust boundaries (`SYSTEM_PROMPT` > `USER_DIRECTIVE` > `AGENT_COMMITTED` > `UNTRUSTED_EXTERNAL`);
   - zero-hallucination argument resolution (`GroundedArgumentResolver`) binding JSON schema parameters to extracted evidence without inventing paths, tests, or commands;
-  - multi-factor candidate scoring and deterministic ranking/bounding (default $K=8$), prioritizing user-directed requests, failures, verification obligations, and complete tool actions;
-  - full enforcement of `tool_choice` policies (`none`, named tool, `required` [restricted to low-risk actions], and `auto`);
+  - tool-choice eligibility enforcement before candidate truncation and multi-factor deterministic candidate ranking/bounding (default $K=8$);
   - golden evaluation dataset (`tests/fixtures/grounding/decision_points.json`) with 35 curated coding decision points across train, dev, and held-out test splits;
   - evaluation CLI (`python -m alienese.grounding.eval`) demonstrating:
-    - Held-out test split: Oracle Recall@1 **90.00%** (vs Phase 1 baseline **10.00%**, **+80.00% lift**), Recall@4/8 **90.00%**, Argument Completeness **100.00%**, Executable Validity **100.00%**, Fabrication Count **0**;
-    - Overall corpus (N=35): Oracle Recall@1 **82.86%** (vs Phase 1 baseline **17.14%**, **+65.72% lift**), Recall@4/8 **85.71%**, Executable Validity **100.00%**, Fabrication Count **0**.
+    - Held-out test split (Action N=9, Abstain N=1): Oracle Recall@1 **8/9 (88.9%)** (vs Phase 1 baseline **3/9 [33.3%]**, **+55.6% lift**), Recall@4/8 **8/9 (88.9%)**, Exact Arg Accuracy **8/9 (88.9%)**, Arg Presence **8/8 (100.0%)**, Abstention Correctness **1/1 (100.0%)**, Executable Validity **10/10 (100.0%)**, Fabrication Count **0/10**;
+    - Overall corpus (Total N=35, Action N=29, Abstain N=6): Oracle Recall@1 **23/29 (79.3%)** (vs Phase 1 baseline **6/29 [20.7%]**, **+58.6% lift**), Recall@4/8 **24/29 (82.8%)**, Exact Arg Accuracy **24/29 (82.8%)**, Abstention Correctness **6/6 (100.0%)**, Executable Validity **28/28 (100.0%)**, Fabrication Count **0/28**.
 
 Default `pytest` execution remains 100% offline and deterministic (`ALIENESE_PROVIDER_MODE=fake` by default, even when `.env` contains live API keys).
 

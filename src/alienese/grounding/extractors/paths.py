@@ -43,9 +43,16 @@ class PathExtractor:
         results: list[GroundingEvidence] = []
         scanned_events = events[-MAX_EVENTS_SCANNED:]
 
+        # Map tool_call_id to corresponding call event
+        call_events_by_id: dict[str, NormalizedEvent] = {}
         for ev in scanned_events:
-            # 1. Traceback file paths in tool results or assistant messages
+            if ev.kind == EventKind.TOOL_CALL and ev.tool_call_id:
+                call_events_by_id[ev.tool_call_id] = ev
+
+        for ev in scanned_events:
             bounded_content = ev.content[:MAX_CHARS_PER_OBSERVATION]
+
+            # 1. Traceback file paths in tool results or assistant messages
             for match in _PYTHON_TRACEBACK_FILE_RE.finditer(bounded_content):
                 raw_path = match.group(1)
                 line_no = int(match.group(2))
@@ -100,6 +107,7 @@ class PathExtractor:
                                     is_direct=True,
                                     status=EvidenceStatus.OBSERVED,
                                     tool_call_id=ev.tool_call_id,
+                                    metadata={"source_tool": ev.tool_name or ""},
                                 )
                             )
 
@@ -128,20 +136,24 @@ class PathExtractor:
                             )
                         )
 
-            # 4. File listings or confirmed outputs in tool results
-            if ev.kind == EventKind.TOOL_RESULT:
-                lines = bounded_content.splitlines()
-                # If tool output is a list of paths (e.g. ls, find)
-                for line in lines[:500]:
-                    stripped = line.strip()
-                    if not stripped or len(stripped) > 512:
-                        continue
-                    # Match clean paths on single lines
-                    if "/" in stripped or stripped.endswith(
-                        (".py", ".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".ts", ".js")
-                    ):
+            # 4. File listings in tool results (only when explicitly a directory/listing tool)
+            if ev.kind == EventKind.TOOL_RESULT and ev.tool_call_id:
+                call_ev = call_events_by_id.get(ev.tool_call_id)
+                call_name = call_ev.tool_name if call_ev else ev.tool_name
+                tool_name = (call_name or "").lower()
+                is_listing_tool = any(
+                    name in tool_name for name in ("list", "ls", "find", "dir", "tree", "glob")
+                )
+                if is_listing_tool:
+                    lines = bounded_content.splitlines()
+                    for line in lines[:500]:
+                        stripped = line.strip()
+                        if not stripped or len(stripped) > 512:
+                            continue
+                        if stripped.startswith(("-", "total ", "drwx", "-rwx")):
+                            continue
                         norm = normalize_file_path(stripped)
-                        if norm and not norm.startswith(("-", "total ", "drwx", "-rwx")):
+                        if norm:
                             results.append(
                                 GroundingEvidence(
                                     evidence_id=deterministic_evidence_id(
@@ -157,7 +169,7 @@ class PathExtractor:
                                     trust=ev.trust,
                                     sequence_no=ev.sequence_no,
                                     is_direct=True,
-                                    status=EvidenceStatus.CONFIRMED,
+                                    status=EvidenceStatus.OBSERVED,
                                     tool_call_id=ev.tool_call_id,
                                 )
                             )

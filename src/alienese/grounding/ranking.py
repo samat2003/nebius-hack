@@ -9,6 +9,7 @@ from alienese.contracts.candidates import (
     CostClass,
     RiskClass,
 )
+from alienese.contracts.events import TrustLevel
 from alienese.contracts.state import CanonicalCapability, WorkingState
 from alienese.grounding.evidence import EvidenceStatus, GroundingEvidence
 
@@ -31,6 +32,23 @@ def score_candidate(
         score += 200.0
     else:
         score += 20.0
+
+    # 2. Trust tier bonus from supporting evidence provenance
+    trust_weights = {
+        TrustLevel.SYSTEM_TRUSTED: 100.0,
+        TrustLevel.USER: 75.0,
+        TrustLevel.MODEL_GENERATED: 50.0,
+        TrustLevel.UNTRUSTED_EXTERNAL: 25.0,
+    }
+    if candidate.evidence_refs:
+        ref_provenances = set(candidate.evidence_refs)
+        max_trust = 0.0
+        for evi in evidence_items:
+            if evi.source_provenance in ref_provenances:
+                t_score = trust_weights.get(evi.trust, 0.0)
+                if t_score > max_trust:
+                    max_trust = t_score
+        score += max_trust
 
     # 3. User request alignment: path or tool explicitly in user prompt
     if user_request:
@@ -60,11 +78,7 @@ def score_candidate(
             # Penalize finishing before verification
             score -= 100.0
 
-    # 6. Direct evidence alignment
-    if candidate.evidence_refs:
-        score += 30.0
-
-    # 7. Redundancy & repetition penalty: avoid repeating exact recent actions
+    # 6. Redundancy & repetition penalty: avoid repeating exact recent actions
     for past_act in state.recent_actions:
         if (
             past_act.tool_name == candidate.external_tool_name
@@ -73,13 +87,13 @@ def score_candidate(
             score -= 60.0
             break
 
-    # 8. Risk adjustments
+    # 7. Risk adjustments
     if candidate.risk_class == RiskClass.HIGH:
         score -= 40.0
     elif candidate.risk_class == RiskClass.MEDIUM:
         score -= 10.0
 
-    # 9. Cost adjustments
+    # 8. Cost adjustments
     if candidate.cost_class == CostClass.HIGH:
         score -= 10.0
 
