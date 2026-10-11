@@ -1,0 +1,75 @@
+{
+  "status": "SUCCESS",
+  "task": "token",
+  "description": "Single-module token TTL past-offset expiration bug",
+  "execution_mode": "OFFLINE_SIMULATION",
+  "is_live_inference": false,
+  "simulation_notice": "SIMULATED / REPLAYED - No live model inference was performed.",
+  "elapsed_ms": 666.45,
+  "model_telemetry": {
+    "simulated": true,
+    "note": "SIMULATED / REPLAYED - No live model inference was performed.",
+    "attempts": 1
+  },
+  "applied_diff": "--- a/auth/token.py\n+++ b/auth/token.py\n@@ -8,11 +8,10 @@\n         self.tokens: dict[str, float] = {}\n \n     def issue_token(self, token_id: str) -> None:\n-        # BUG: Stored token timestamp with past offset instead of current timestamp\n-        self.tokens[token_id] = time.time() - (self.ttl_seconds + 100)\n+        self.tokens[token_id] = time.time()\n \n     def is_valid(self, token_id: str) -> bool:\n         created_at = self.tokens.get(token_id)\n         if created_at is None:\n             return False\n-        return (time.time() - created_at) < self.ttl_seconds\n+        return (time.time() - created_at) < self.ttl_seconds",
+  "steps": [
+    {
+      "step": 1,
+      "action": "run_test",
+      "target": "tests/test_token.py",
+      "passed": false,
+      "output_summary": "e4761b0>.is_valid\n\ntests/test_token.py:8: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_token.py::test_fresh_token_is_valid - AssertionError: Fresh...\n============================== 1 failed in 0.01s ===============================\n"
+    },
+    {
+      "step": 2,
+      "turn": 1,
+      "tool": "read_file",
+      "args": {
+        "path": "tests/test_token.py"
+      },
+      "success": true,
+      "candidate_count": 1
+    },
+    {
+      "step": 2.5,
+      "action": "read_source",
+      "path": "auth/token.py",
+      "success": true,
+      "bytes_read": 622
+    },
+    {
+      "step": 3,
+      "turn": 2,
+      "attempt": 1,
+      "action": "write_file",
+      "path": "auth/token.py",
+      "success": true,
+      "model_telemetry": {
+        "simulated": true,
+        "note": "SIMULATED / REPLAYED - No live model inference was performed.",
+        "attempts": 1
+      },
+      "diff": "--- a/auth/token.py\n+++ b/auth/token.py\n@@ -8,11 +8,10 @@\n         self.tokens: dict[str, float] = {}\n \n     def issue_token(self, token_id: str) -> None:\n-        # BUG: Stored token timestamp with past offset instead of current timestamp\n-        self.tokens[token_id] = time.time() - (self.ttl_seconds + 100)\n+        self.tokens[token_id] = time.time()\n \n     def is_valid(self, token_id: str) -> bool:\n         created_at = self.tokens.get(token_id)\n         if created_at is None:\n             return False\n-        return (time.time() - created_at) < self.ttl_seconds\n+        return (time.time() - created_at) < self.ttl_seconds"
+    },
+    {
+      "step": 4,
+      "turn": 3,
+      "action": "run_test",
+      "target": "tests/test_token.py",
+      "passed": true,
+      "output_summary": "p_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 1 item\n\ntests/test_token.py::test_fresh_token_is_valid PASSED                    [100%]\n\n============================== 1 passed in 0.01s ===============================\n"
+    },
+    {
+      "step": 5,
+      "action": "run_acceptance_test",
+      "target": "tests/test_acceptance.py",
+      "passed": true,
+      "output_summary": "p_scope=None, asyncio_default_test_loop_scope=function\ncollecting ... collected 1 item\n\ntests/test_acceptance.py::test_token_expiration_behavior PASSED          [100%]\n\n============================== 1 passed in 0.01s ===============================\n"
+    },
+    {
+      "step": 6,
+      "turn": 4,
+      "explanation": "Fixed auth/token.py logic to ensure test and acceptance test pass."
+    }
+  ]
+}
