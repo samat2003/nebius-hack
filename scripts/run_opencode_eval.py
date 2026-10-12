@@ -264,6 +264,7 @@ def setup_disposable_workspace(ws: Path) -> None:
     plugin_js = REPO_ROOT / "plugins" / "opencode" / "alienese.js"
     opencode_cfg = {
         "$schema": "https://opencode.ai/config.json",
+        "model": "nebius/nvidia/nemotron-3-super-120b-a12b",
         "plugin": [str(plugin_js.resolve())],
         "provider": {
             "nebius": {

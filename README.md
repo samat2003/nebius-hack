@@ -71,57 +71,22 @@ See [docs/OPENCODE_QUICKSTART.md](docs/OPENCODE_QUICKSTART.md) for full configur
 
 ---
 
-## 3. Why Alienese Is Different
+## 3. Architecture: Multi-Model Orchestration & Deterministic Control
 
-Standard coding agents ask a large LLM to freely generate tool names and JSON arguments. When an error occurs, the model guesses file locations and commands.
+Standard coding agents ask a large LLM to freely generate tool names and JSON arguments. When an error occurs, the model guesses file locations and commands, frequently falling into hallucination loops.
 
-Alienese separates responsibility: code extracts deterministic facts, policy ranks bounded candidates, and the model handles narrow code synthesis within harness-constrained boundaries.
+Alienese decomposes the agent runtime: deterministic code extracts verified facts, policy ranks bounded candidates, and specialized models handle narrow tasks within harness-constrained boundaries.
 
-```text
-[Failing Test Traceback]
-          │
-          ▼
-┌───────────────────────────────────────────────┐
-│ 1. Deterministic Grounding Subsystem          │
-│    - Extracts exact file paths & test targets │
-│    - Binds schema parameters to real evidence │
-│    - Rejects path traversals & unsafe flags   │
-│    - Generates bounded candidate set (K ≤ 8)  │
-└───────────────────────┬───────────────────────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────┐
-│ 2. Grounded Controller Decision (Turn 1)      │
-│    - Selects grounded action from candidate   │
-│      set (read_file tests/test_session.py)    │
-│    - Produces SHA-256 state digest & trace    │
-└───────────────────────┬───────────────────────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────┐
-│ 3. Harness-Constrained Context Inspection     │
-│    - Reads imported modules from sandbox      │
-│      (auth/token_store.py & session_manager)  │
-│    - Verifies path containment & allowlists   │
-└───────────────────────┬───────────────────────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────┐
-│ 4. NVIDIA Nemotron 3 Super (Nebius Factory)   │
-│    - Receives labeled test + source context   │
-│    - Synthesizes targeted Python repair       │
-│    - Validated via AST syntax compilation     │
-└───────────────────────┬───────────────────────┘
-                        │
-                        ▼
-┌───────────────────────────────────────────────┐
-│ 5. Verification & Independent Acceptance Check│
-│    - Strict sandbox applies diff to workspace │
-│    - Re-runs target suite (RED ➔ GREEN)       │
-│    - Re-runs independent unseen acceptance    │
-│    - Generates diff-grounded explanation      │
-└───────────────────────────────────────────────┘
-```
+![Alienese Architecture Diagram](docs/architecture.png)
+
+### Model Specialization & Runtime Responsibilities
+
+| Subsystem | Model / Technology | Core Responsibility |
+| :--- | :--- | :--- |
+| **Retrieval & Context Reduction** | **EmbeddingGemma 2** | Dense semantic ranking over repository symbols and AST dependency extraction; filters noise to preserve correctness-critical context without bloating prompt budgets. |
+| **Decision & Control Policy** | **mini-Jev** (mini-Jev-SWE) | State-machine controller that selects actions from finite, grounded candidate sets ($K \le 8$). Models never invent arbitrary paths, flags, or shell commands. |
+| **Generation & Reasoning** | **NVIDIA Nemotron 3 Super (120B-A12B)** via **Nebius Token Factory** | Narrow, typed code synthesis: receives labeled test and source context to synthesize targeted Python repairs and diff-grounded explanations. |
+| **Verification & Execution Sandbox** | **Alienese Engine + Pytest** | Enforces workspace containment allowlists, computes SHA-256 state provenance digests, and mandates a verification obligation (RED ➔ GREEN pytest) before completion. |
 
 ### A Real Trace Walkthrough (`--task integration`)
 1. **Failure Evidence:** Initial pytest run fails on `test_session_refresh_lifecycle` in `tests/test_session.py` (`AssertionError`).
