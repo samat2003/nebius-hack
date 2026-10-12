@@ -49,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     stat.add_argument("--session", default="default", help="OpenCode session ID")
     stat.add_argument("--trace-file", default=None, help="Custom trace file path")
 
+    # plan subcommand
+    plan = subparsers.add_parser(
+        "plan",
+        help="Execute multi-model planning via EmbeddingGemma 2 and mini-Jev",
+    )
+    plan.add_argument("--workspace", required=True, help="Workspace directory")
+    plan.add_argument("--session", default="default", help="OpenCode session ID")
+    plan.add_argument("--goal", default="", help="User goal or failure description")
+    plan.add_argument("--trace-file", default=None, help="Custom trace file path")
+
     return parser.parse_args()
 
 
@@ -103,6 +113,16 @@ def main() -> None:
         )
         status = tracker.get_status()
         sys.stdout.write(json.dumps(status) + "\n")
+        sys.stdout.flush()
+
+    elif args.command == "plan":
+        tracker = OpenCodeSessionTracker(
+            workspace=workspace,
+            session_id=args.session,
+            trace_file=trace_path,
+        )
+        result = tracker.plan(goal=args.goal)
+        sys.stdout.write(json.dumps(result) + "\n")
         sys.stdout.flush()
 
 

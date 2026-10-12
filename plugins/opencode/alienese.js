@@ -82,15 +82,48 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
   console.error("==================================================================");
 
   return {
+    tool: {
+      alienese_plan: {
+        description:
+          "Invoke Alienese's multi-model orchestration engine (EmbeddingGemma 2 retrieval ranking + mini-Jev decision controller) to analyze repository context, rank files, and select the optimal grounded next action. Call this tool before reading or editing code.",
+        args: {
+          goal: {
+            type: "string",
+            description: "The coding task, failing test, or bug description to analyze.",
+          },
+        },
+        execute: async (args, context) => {
+          const goal = args?.goal || "";
+          const sessionID = context?.sessionID || "default";
+          const targetDir = context?.directory || workspaceDir;
+          const bridgeArgs = [
+            "plan",
+            "--workspace", targetDir,
+            "--session", sessionID,
+            "--goal", goal,
+          ];
+          const result = invokeBridge(pythonCmd, targetDir, bridgeArgs);
+          if (!result) {
+            return "Alienese planning bridge unavailable.";
+          }
+          if (typeof result === "string") {
+            return result;
+          }
+          return result.plan_text || JSON.stringify(result, null, 2);
+        },
+      },
+    },
+
     "tool.execute.before": async (input, output) => {
       const toolName = input?.tool || "unknown";
       const callID = input?.callID || "";
       const sessionID = input?.sessionID || "default";
+      const targetDir = input?.directory || workspaceDir;
       const args = output?.args || {};
 
       const bridgeArgs = [
         "pre-tool",
-        "--workspace", workspaceDir,
+        "--workspace", targetDir,
         "--session", sessionID,
         "--tool", toolName,
         "--call-id", callID,
@@ -102,7 +135,7 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
         bridgeArgs.push("--read-only-tests");
       }
 
-      const decision = invokeBridge(pythonCmd, workspaceDir, bridgeArgs);
+      const decision = invokeBridge(pythonCmd, targetDir, bridgeArgs);
       if (!decision) {
         // Fallback safely if bridge was unreachable
         return;
@@ -122,6 +155,7 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
       const toolName = input?.tool || "unknown";
       const callID = input?.callID || "";
       const sessionID = input?.sessionID || "default";
+      const targetDir = input?.directory || workspaceDir;
       const args = input?.args || {};
 
       const rawOutput = output?.output || output?.title || "";
@@ -129,7 +163,7 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
 
       const bridgeArgs = [
         "post-tool",
-        "--workspace", workspaceDir,
+        "--workspace", targetDir,
         "--session", sessionID,
         "--tool", toolName,
         "--call-id", callID,
@@ -137,7 +171,7 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
         "--output", JSON.stringify(outputText),
       ];
 
-      const result = invokeBridge(pythonCmd, workspaceDir, bridgeArgs);
+      const result = invokeBridge(pythonCmd, targetDir, bridgeArgs);
       if (!result) {
         return;
       }

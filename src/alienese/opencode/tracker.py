@@ -46,6 +46,7 @@ _TOOL_CAPABILITY_MAP: dict[str, CanonicalCapability] = {
     "bash": CanonicalCapability.RUN_COMMAND,
     "run_command": CanonicalCapability.RUN_COMMAND,
     "command": CanonicalCapability.RUN_COMMAND,
+    "alienese_plan": CanonicalCapability.CUSTOM_TOOL,
 }
 
 _PROTECTED_BASENAMES: frozenset[str] = frozenset(
@@ -645,7 +646,7 @@ class OpenCodeSessionTracker:
                 data=emb_payload,
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
                 emb_data = json.loads(resp.read().decode("utf-8"))
                 vectors = [item["embedding"] for item in emb_data["data"]]
                 q_vec = vectors[0]
@@ -706,7 +707,7 @@ class OpenCodeSessionTracker:
                 data=pred_payload,
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
                 decision_data = json.loads(resp.read().decode("utf-8"))
         except Exception:
             return None
@@ -738,4 +739,246 @@ class OpenCodeSessionTracker:
             },
             "retrieval_summary": retrieval_summary,
             "decision_summary": decision_summary,
+        }
+
+    def plan(self, goal: str = "") -> dict[str, Any]:
+        """Execute multi-model planning using EmbeddingGemma 2 and mini-Jev."""
+        import os
+        import urllib.request
+
+        three_model_env = os.environ.get("ALIENESE_THREE_MODEL") == "1"
+
+        server_healthy = False
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8001/health")
+            with urllib.request.urlopen(req, timeout=0.5) as resp:
+                if resp.status == 200:
+                    health_data = json.loads(resp.read().decode("utf-8"))
+                    server_healthy = health_data.get("status") == "ok"
+        except Exception:
+            server_healthy = False
+
+        if not three_model_env or not server_healthy:
+            msg = (
+                "Alienese three-model services (EmbeddingGemma 2 retriever and mini-Jev "
+                "controller) are unavailable. To enable multi-model planning, start the local "
+                "model server on port 8001 and run OpenCode with `--three-model`."
+            )
+            plan_text = (
+                "### Alienese Plan (Three-Model Service Unavailable)\n\n"
+                f"**Notice:** {msg}\n\n"
+                "Please proceed with standard investigation using `read` or `bash`."
+            )
+            return {
+                "status": "unavailable",
+                "three_model_active": False,
+                "server_healthy": server_healthy,
+                "message": msg,
+                "plan_text": plan_text,
+            }
+
+        # 1. Discover candidate python files in workspace
+        candidate_files: list[tuple[str, str]] = []
+        for p in self.workspace.rglob("*.py"):
+            parts = p.parts
+            if (
+                ".alienese" in parts
+                or ".venv" in parts
+                or "__pycache__" in parts
+                or ".git" in parts
+            ):
+                continue
+            try:
+                rel_str = str(p.relative_to(self.workspace)).replace("\\", "/")
+                snippet = p.read_text(encoding="utf-8")[:500]
+                candidate_files.append((rel_str, snippet))
+            except Exception:
+                continue
+
+        # Determine query text
+        query_text = goal.strip()
+        if not query_text:
+            for ev in reversed(self.evidence_log):
+                val = str(ev.get("value", ""))
+                if ev.get("category") == "failed_test" or "error" in val.lower():
+                    query_text = val[:200]
+                    break
+        if not query_text:
+            query_text = "Fix test failure and session refresh regression"
+
+        # 2. EmbeddingGemma 2 retrieval ranking
+        formatted_inputs = [
+            f"task: code retrieval | query: {query_text}",
+            *[f"title: {f[0]} | text: {f[1]}" for f in candidate_files[:8]],
+        ]
+        emb_payload = json.dumps(
+            {
+                "model": "google/embeddinggemma-2",
+                "input": formatted_inputs,
+                "dimensions": 768,
+            }
+        ).encode("utf-8")
+
+        ranked_files: list[tuple[str, float]] = []
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8001/embeddings",
+                data=emb_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                emb_data = json.loads(resp.read().decode("utf-8"))
+                vectors = [item["embedding"] for item in emb_data["data"]]
+                q_vec = vectors[0]
+                for idx, (fpath, _) in enumerate(candidate_files[:8]):
+                    d_vec = vectors[idx + 1]
+                    dot = sum(a * b for a, b in zip(q_vec, d_vec, strict=True))
+                    ranked_files.append((fpath, round(dot, 4)))
+            ranked_files.sort(key=lambda x: -x[1])
+        except Exception as e:
+            return {
+                "status": "error",
+                "three_model_active": True,
+                "message": f"EmbeddingGemma 2 retrieval error: {e}",
+                "plan_text": f"Error during EmbeddingGemma ranking: {e}",
+            }
+
+        top_file = ranked_files[0][0] if ranked_files else "auth/session_manager.py"
+        test_file = next(
+            (f[0] for f in candidate_files if "test" in f[0] and "acceptance" not in f[0]),
+            "tests/test_session.py",
+        )
+        second_file = ranked_files[1][0] if len(ranked_files) > 1 else "auth/token_store.py"
+
+        # 3. Construct multiple grounded next action options (K >= 2, K <= 8)
+        answer_options = [
+            {
+                "id": "act_inspect_top",
+                "label": f"read: {top_file}",
+                "type": "external_tool",
+                "description": f"Read and inspect primary candidate module {top_file}",
+            },
+            {
+                "id": "act_run_pytest",
+                "label": f"bash: pytest {test_file}",
+                "type": "external_tool",
+                "description": f"Run tests in {test_file} to verify current behavior",
+            },
+            {
+                "id": "act_inspect_dep",
+                "label": f"read: {second_file}",
+                "type": "external_tool",
+                "description": f"Inspect secondary dependency {second_file}",
+            },
+        ]
+
+        # 4. mini-Jev decision controller evaluation
+        pred_payload = json.dumps(
+            {
+                "model": "samatv256/mini-Jev",
+                "revision": "step-010626",
+                "state": {
+                    "user_goal": query_text,
+                    "summary": (
+                        f"mutations={len(self.mutations)};"
+                        f"verification_needed={self.verification_obligation}"
+                    ),
+                    "environment": {
+                        "available_tool_count": len(answer_options),
+                        "mutation_attempted": bool(self.mutations),
+                        "verification_confirmed": not self.verification_obligation,
+                    },
+                    "history": [
+                        {"role": "user", "content": query_text},
+                        {"role": "assistant", "content": f"Identified top candidate: {top_file}"},
+                    ],
+                },
+                "question": "Which grounded action should be executed next?",
+                "question_type": "choice",
+                "answer_options": answer_options,
+            }
+        ).encode("utf-8")
+
+        decision_data: dict[str, Any] = {}
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8001/predict",
+                data=pred_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                decision_data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return {
+                "status": "error",
+                "three_model_active": True,
+                "message": f"mini-Jev controller decision error: {e}",
+                "plan_text": f"Error during mini-Jev decision evaluation: {e}",
+            }
+
+        selected_id = decision_data.get("selected_id", answer_options[0]["id"])
+        selected_label = decision_data.get("selected_label", answer_options[0]["label"])
+        options = decision_data.get("options", [])
+        opt_probs_map = {opt["id"]: opt.get("probability", 0.0) for opt in options}
+        selected_prob = opt_probs_map.get(selected_id, 0.0)
+
+        # 5. Format structured markdown plan for Nemotron's context
+        ranked_bullets = "\n".join(
+            f"  {idx + 1}. `{f}` (cosine similarity: {score:.4f})"
+            for idx, (f, score) in enumerate(ranked_files[:4])
+        )
+        options_bullets = "\n".join(
+            f"  - `{opt['id']}`: {opt.get('label', opt['id'])} "
+            f"(probability: {opt.get('probability', 0.0):.4f})"
+            + (" [SELECTED]" if opt["id"] == selected_id else "")
+            for opt in options
+        )
+
+        plan_text = (
+            "### Alienese Multi-Model Orchestration Plan\n\n"
+            f"**Objective:** {query_text}\n\n"
+            "**1. Retrieval Context Ranking "
+            "(EmbeddingGemma 2 — 768d Dense Matryoshka Embeddings):**\n"
+            f"{ranked_bullets}\n\n"
+            "**2. Grounded Decision Policy (mini-Jev @ step-010626):**\n"
+            f"Evaluated {len(answer_options)} grounded candidate actions with trained set-head:\n"
+            f"{options_bullets}\n"
+            f"- **Selected Policy Action:** `{selected_label}` "
+            f"(confidence: {selected_prob:.1%})\n\n"
+            "**3. Concrete Directives for Coding Model:**\n"
+            f"- **Step 1:** Use `read` to inspect `{top_file}` at the relevant functions.\n"
+            f"- **Step 2:** Synthesize the fix in `{top_file}` using `edit` (or `write`).\n"
+            f"- **Step 3:** Verify your fix by running `pytest {test_file}` via `bash` "
+            "to fulfill the verification obligation."
+        )
+
+        # 6. Record immutable trace record in opencode_trace.jsonl
+        self.sequence_no += 1
+        plan_details = {
+            "query": query_text,
+            "ranked_files": ranked_files,
+            "options": options,
+            "selected_id": selected_id,
+            "selected_label": selected_label,
+            "selected_probability": selected_prob,
+        }
+        self._record_trace(
+            "ALIENESE_PLAN",
+            "alienese_plan",
+            {"goal": query_text},
+            plan_details,
+            output_summary=plan_text[:500],
+        )
+
+        return {
+            "status": "success",
+            "three_model_active": True,
+            "query": query_text,
+            "top_file": top_file,
+            "ranked_files": ranked_files,
+            "options": options,
+            "selected_id": selected_id,
+            "selected_label": selected_label,
+            "selected_probability": selected_prob,
+            "plan_text": plan_text,
         }

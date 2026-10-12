@@ -430,7 +430,7 @@ def main() -> None:
         [
             "bash",
             "-c",
-            f'"{opencode_bin}" run --auto -m "{args.model}" "{task_prompt}"',
+            f'"{opencode_bin}" run --auto --dir "{ws}" -m "{args.model}" "{task_prompt}"',
         ],
         cwd=ws,
         env=env,

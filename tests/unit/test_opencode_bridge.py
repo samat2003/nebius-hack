@@ -260,3 +260,27 @@ def test_cli_bridge_subprocess() -> None:
         status_res = json.loads(proc.stdout.strip())
         assert status_res["session_id"] == "cli-test"
         assert status_res["sequence_no"] >= 2
+
+        # 4. plan subcommand test via subprocess when three-model is disabled
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "alienese.opencode.bridge",
+                "plan",
+                "--workspace",
+                str(ws),
+                "--session",
+                "cli-test",
+                "--goal",
+                "inspect auth service",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={"PATH": sys.exec_prefix + "/bin", "ALIENESE_THREE_MODEL": "0"},
+        )
+        plan_res = json.loads(proc.stdout.strip())
+        assert plan_res["status"] == "unavailable"
+        assert plan_res["three_model_active"] is False
+        assert "plan_text" in plan_res
