@@ -58,6 +58,13 @@ def clean_stale_opencode_sessions() -> None:
         c = conn.cursor()
         c.execute("DELETE FROM session WHERE directory != ?;", (str(DEMO_DIR),))
         c.execute("DELETE FROM project_directory WHERE directory != ?;", (str(DEMO_DIR),))
+        c.execute("DELETE FROM project WHERE worktree != ? AND id != 'global';", (str(DEMO_DIR),))
+        now_ms = int(time.time() * 1000)
+        c.execute(
+            "INSERT OR REPLACE INTO project_directory (project_id, directory, time_created) "
+            "VALUES ('global', ?, ?);",
+            (str(DEMO_DIR), now_ms),
+        )
         conn.commit()
         conn.close()
     except Exception:
@@ -70,6 +77,7 @@ def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
         shutil.rmtree(ws)
 
     ws.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=ws, capture_output=True)
 
     # Source code
     auth_dir = ws / "auth"
