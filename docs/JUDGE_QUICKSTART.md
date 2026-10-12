@@ -30,7 +30,7 @@ python scripts/run_coding_task.py --task integration --out results/judge_offline
 - Alienese deterministically grounds the failure traceback and discovers `auth/token_store.py` and `auth/session_manager.py`.
 - Generates unified diff updating `session["active_token_id"] = new_token_id`.
 - Re-runs target suite: **3 passed**.
-- Runs independent unseen acceptance suite: **2 passed**.
+- Runs independent unseen acceptance suite: **3 passed**.
 - Workflow status: **SUCCESS**.
 
 ---
@@ -51,11 +51,11 @@ python scripts/run_coding_task.py --task integration --live --out results/live_r
 ```
 
 **Observed Live Metrics:**
-- **End-to-End Workflow Latency:** 3,382 ms.
-- **Nemotron Generation Latency:** 1,935.8 ms (2,273 total tokens, 536 completion tokens).
-- **Patch Verification:** All 3 target tests and 2 independent acceptance tests pass.
+- **End-to-End Workflow Latency:** 3,118 ms.
+- **Nemotron Generation Latency:** 2,042.0 ms (2,309 total tokens, 559 completion tokens).
+- **Patch Verification:** All 3 target tests and 3 independent acceptance tests pass.
 - **Workflow Architecture:** Evidence-grounded inspection with harness-constrained repair (Alienese deterministically grounds failure traceback to test file; harness inspects imported modules and constrains model write to designated target module).
-- **Post-Mortem Explanation:** Derived strictly from verified diff, correctly explaining the stale active token reference and session update without contradiction.
+- **Post-Mortem Explanation:** Derived strictly from verified diff, correctly explaining token validation before session state update and revocation without contradiction.
 - **Transparent Output:** Complete step-by-step trace and unified diff written to stdout and `results/live_run_report.json`.
 
 ---
@@ -71,7 +71,7 @@ Alienese provides two independent benchmark challenges:
 | **Fault Mechanism** | Negative timestamp offset on issue | Session refresh revoked old token in store but did not update session's active pointer |
 | **Grounding Scope** | Single file traceback reference | Discovers cross-module dependencies via test import inspection |
 | **Target Tests** | `tests/test_token.py` (1 test) | `tests/test_session.py` (3 tests: create, terminate, refresh) |
-| **Acceptance Suite** | `tests/test_acceptance.py` (1 test) | `tests/test_acceptance.py` (2 tests: multi-refresh continuity, error rejection) |
+| **Acceptance Suite** | `tests/test_acceptance.py` (1 test) | `tests/test_acceptance.py` (3 tests: multi-refresh continuity, error rejection, rollback without mutation) |
 | **Model Prompt** | Buggy module + failing test | Discovered modules + failing test + partial traceback |
 | **Offline Command** | `python scripts/run_coding_task.py --task token` | `python scripts/run_coding_task.py --task integration` |
 | **Live Command** | `python scripts/run_coding_task.py --task token --live` | `python scripts/run_coding_task.py --task integration --live` |
@@ -103,7 +103,7 @@ Every action executed by Alienese operates within strict security boundaries:
 ## 6. Running the Full Test Suite & Static Quality Gates
 
 ```bash
-# Run 180+ offline unit, regression, and fault tests
+# Run 185 offline unit, regression, and fault tests
 pytest -q
 
 # Run static type checking

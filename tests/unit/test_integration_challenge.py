@@ -188,9 +188,34 @@ def test_repair_prompt_no_answer_leakage_and_acceptance_separation() -> None:
         # 3. Acceptance tests strictly excluded
         assert "test_session_multi_refresh_continuity" not in prompt
         assert "test_unregistered_session_refresh_rejected" not in prompt
+        assert "test_revoked_token_session_refresh_rejected_without_mutation" not in prompt
         assert "tests/test_acceptance.py" not in prompt
 
         # 4. Context contains authentic buggy code and failing test
         assert "def test_session_refresh_lifecycle():" in prompt
         assert "class SessionManager:" in prompt
         assert "class TokenStore:" in prompt
+
+
+def test_revoked_token_refresh_regression_without_mutation() -> None:
+    """Verifies refreshing a session with a revoked token returns None without mutating state."""
+    task = TASKS["integration"]
+    with tempfile.TemporaryDirectory() as tmp_str:
+        ws = Path(tmp_str)
+        harness = StandaloneCodingHarness(ws, writable_allowlist=task.writable_allowlist)
+        harness.setup_task_repo(task)
+
+        # Apply the verified offline fix
+        ok_write, _ = harness.execute_tool(
+            "write_file",
+            {
+                "path": task.target_module,
+                "content": task.offline_simulated_repair.strip("`\n").removeprefix("python\n"),
+            },
+        )
+        assert ok_write
+
+        # Run acceptance test suite which now includes the revoked token rollback check
+        ok_acc, acc_out = harness.execute_tool("run_test", {"target": task.acceptance_test})
+        assert ok_acc, f"Acceptance test failed: {acc_out}"
+        assert "test_revoked_token_session_refresh_rejected_without_mutation PASSED" in acc_out

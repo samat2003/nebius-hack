@@ -13,7 +13,7 @@ Coding agents often fail acutely in production: unconstrained LLMs hallucinate n
 - 📖 **Judge Quickstart Guide:** [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md)
 - 📊 **Live Run Report:** [results/live_run_report.json](results/live_run_report.json)
 - 🛡️ **Comparative Safety Benchmark:** [results/benchmark_report.md](results/benchmark_report.md)
-- 📦 **Latest Release:** [v0.1.3-submission](https://github.com/samat2003/nebius-hack/releases)
+- 📦 **Latest Release:** [v0.1.4-submission](https://github.com/samat2003/nebius-hack/releases)
 
 ---
 
@@ -114,11 +114,21 @@ Alienese separates responsibility: code extracts deterministic facts, policy ran
           old_token = self.token_store.get_token(old_token_id)
           if old_token is None:
               return None
-   +      # Update active token ID in session to reflect the new token
+
+   +      # Store new token first to ensure it's available
+          self.token_store.store_token(
+              token_id=new_token_id,
+              user_id=session["user_id"],
+              ttl_seconds=self.session_ttl,
+          )
+   +      # Update session state
    +      session["active_token_id"] = new_token_id
+   +      # Revoke old token after successful update
+          self.token_store.revoke_token(old_token_id)
+          return session
    ```
-5. **Test & Acceptance Verification (Turn 3):** Sandboxed harness verifies all 3 unit tests pass and both independent unseen acceptance tests pass (5/5 tests).
-6. **Diff-Grounded Post-Mortem (Turn 4):** Nebius Nemotron receives the verified diff and generates a 2-sentence explanation accurately identifying the stale active token pointer and resolution.
+5. **Test & Acceptance Verification (Turn 3):** Sandboxed harness verifies all 3 target tests pass and all 3 independent unseen acceptance tests pass (including rollback protection against premature state mutation on failed refresh) (6/6 tests).
+6. **Diff-Grounded Post-Mortem (Turn 4):** Nebius Nemotron receives the verified diff and generates an explanation accurately explaining token validation before session state update and revocation.
 7. **Replay Trace:** Full execution telemetry, token usage, and SHA-256 state digests are logged transparently to `results/live_run_report.json`.
 
 ---
@@ -131,11 +141,11 @@ Alienese separates responsibility: code extracts deterministic facts, policy ran
 |---|---|---|
 | **Task Description** | Cross-module session manager and token store refresh regression | Single-module token TTL past-offset expiration bug |
 | **Modules Involved** | `auth/session_manager.py` + `auth/token_store.py` | `auth/token.py` |
-| **End-to-End Latency** | **3,382 ms** | **1,981 ms** |
-| **Nemotron Generation Latency** | **1,936 ms** | **744 ms** |
-| **Tokens Consumed** | 2,273 total (536 completion) | 850 total (134 completion) |
+| **End-to-End Latency** | **3,118 ms** | **1,981 ms** |
+| **Nemotron Generation Latency** | **2,042 ms** | **744 ms** |
+| **Tokens Consumed** | 2,309 total (559 completion) | 850 total (134 completion) |
 | **Target Test Suite** | 3 passed (100%) | 1 passed (100%) |
-| **Unseen Acceptance Suite** | 2 passed (100%) | 1 passed (100%) |
+| **Unseen Acceptance Suite** | 3 passed (100%) | 1 passed (100%) |
 | **Overall Status** | **SUCCESS** | **SUCCESS** |
 
 ### B. One-Turn Tool-Argument Safety Evaluation (Raw Nemotron vs. Alienese)
@@ -219,7 +229,7 @@ Coding Harness / SWE Runner
 
 ### Step 1. Run Offline Quality Gates (100% Offline, No Secrets)
 ```bash
-# Run all 180+ offline unit, regression, and invariant tests
+# Run all 185 offline unit, regression, and invariant tests
 pytest -q
 
 # Run static type checking

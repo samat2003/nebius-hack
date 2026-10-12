@@ -285,6 +285,21 @@ def test_unregistered_session_refresh_rejected():
     manager = SessionManager(store)
     res = manager.refresh_session("non_existent_sess", "tok_any")
     assert res is None, "Refreshing nonexistent session must return None"
+
+
+def test_revoked_token_session_refresh_rejected_without_mutation():
+    store = TokenStore()
+    manager = SessionManager(store)
+    sess = manager.create_session("sess_revoked_1", "user_rev", "tok_orig")
+
+    # Revoke active token in store
+    store.revoke_token("tok_orig")
+
+    # Refresh must fail and preserve state
+    res = manager.refresh_session("sess_revoked_1", "tok_unauthorized_new")
+    assert res is None, "Refreshing a session with a revoked token must return None"
+    assert sess["active_token_id"] == "tok_orig", "Failed refresh must not mutate active_token_id"
+    assert store.get_token("tok_unauthorized_new") is None, "Failed refresh must not store replacement token"
 '''
 
 OFFLINE_SIMULATED_SESSION_REPAIR = '''```python
@@ -858,7 +873,8 @@ async def run_failing_to_passing_workflow(
             prompt_parts.append(f"Here is the content of the module '{src_path}':\n{src_code}\n")
 
         prompt_parts.append(
-            f"Fix the bug in '{task.target_module}' so that all tests pass.\n"
+            f"Fix the bug in '{task.target_module}' so that all tests pass. "
+            "Ensure state mutations occur only after all validation checks pass.\n"
             f"Output ONLY the complete, corrected Python code for '{task.target_module}' inside a ```python``` code block.\n"
             "Do not include any explanation before or after."
         )
