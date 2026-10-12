@@ -41,34 +41,38 @@ We realized that making coding agents reliable doesn't require a trillion-parame
 
 ## Live Verification & Real-World Results
 
-### 1. Live Autonomous Repair Loop (Nebius Token Factory)
-In our automated demo workflow (`python scripts/run_coding_task.py --live`):
-- **Step 1 (Failing Test):** Pytest executes on `tests/test_token.py` and fails with `AssertionError: Freshly issued token must be valid`.
-- **Step 2 (Deterministic Grounding):** Alienese intercepts the traceback, extracts `tests/test_token.py`, bounds the candidate set ($K=1$), and inspects the test file (281 bytes).
-- **Step 2b (Target Module Inspection):** The sandboxed harness reads the buggy target module `auth/token.py` (622 bytes) from the workspace. Both files are explicitly labeled and validated before invocation.
-- **Step 3 (Genuine Nemotron Code Generation):** Alienese passes the failing test, test file, and source code to NVIDIA Nemotron 3 Super via Nebius Token Factory (`nvidia/nemotron-3-super-120b-a12b`). Nemotron synthesizes the corrected Python implementation of `auth/token.py` (860 tokens, 834.5 ms latency).
-- **Step 4 & 5 (Verification & Acceptance):** The model-generated patch is validated via AST compilation and applied to the disposable workspace. The target test suite (`test_token.py`) and an independent unseen acceptance check (`test_acceptance.py`) both pass cleanly!
-- **Step 6 (Summary Explanation):** Nebius Nemotron 3 Super generates a 2-sentence explanation of why the repair succeeded.
-- **Workflow Runtime:** **1,784 ms** total wall-clock time end-to-end.
+### 1. Primary Demonstration: Cross-Module Integration Debugging (`--task integration`)
+In our automated live workflow (`python scripts/run_coding_task.py --task integration --live`):
+- **Step 1 (Failing Target Suite):** Pytest executes on `tests/test_session.py` and fails with `AssertionError: validate_session() returned False after refresh` (1 failed, 2 passed).
+- **Step 2 (Deterministic Grounding — Alienese Decision):** Alienese intercepts the traceback, bounds the candidate set to K=1, and executes `read_file("tests/test_session.py")` (1,131 bytes) with SHA-256 state reconstruction.
+- **Step 2b (Harness Context Inspection):** Harness inspects test imports and reads cross-module dependencies `auth/token_store.py` (1,302 bytes) and `auth/session_manager.py` (2,317 bytes) from the sandboxed workspace.
+- **Step 3 (Genuine Nemotron Code Generation):** Alienese passes the failing test and discovered source context to NVIDIA Nemotron 3 Super via Nebius Token Factory (`nvidia/nemotron-3-super-120b-a12b`). Nemotron synthesizes the corrected implementation of `auth/session_manager.py`, updating `session["active_token_id"] = new_token_id` (2,273 tokens, 1,935.8 ms latency, Attempt 1/3).
+- **Step 4 & 5 (Verification & Acceptance):** The model patch is validated via AST compilation and applied within strict write allowlists. The target test suite (`test_session.py`, 3 tests) and independent unseen acceptance suite (`test_acceptance.py`, 2 tests) both pass cleanly (5/5 tests)!
+- **Step 6 (Post-Mortem Explanation):** Nebius Nemotron 3 Super receives the verified diff and failing test, generating a concise explanation correctly identifying the stale active token pointer and resolution.
+- **Workflow Runtime:** **3,382 ms** total wall-clock time end-to-end.
 
-### 2. One-Turn Tool-Argument Safety Evaluation (Raw Nemotron vs. Alienese)
-We evaluated unconstrained Raw Nemotron directly against Alienese on Nebius Token Factory across 5 adversarial and ambiguous one-turn scenarios (`results/benchmark_report.md`):
+### 2. Secondary Demonstration: Single-Module Token Expiry (`--task token`)
+- Baseline single-file token expiry demo repairing TTL past-offset arithmetic in `auth/token.py`.
+- **Workflow Runtime:** 1,981 ms total (744 ms Nemotron generation, 850 tokens). 2/2 tests pass.
+
+### 3. One-Turn Tool-Argument Safety Evaluation (Raw Nemotron vs. Alienese)
+We evaluated unconstrained Raw Nemotron directly against Alienese on Nebius Token Factory across five targeted one-turn safety scenarios (`results/benchmark_report.md`):
 - **Out-of-Workspace Path Proposals:** Raw Nemotron proposed reading `/etc/passwd` (1/5, 20.0%). Alienese blocked traversal, proposing 0 out-of-workspace paths (0/5, 0.0%).
 - **Unsupported Target Proposals:** Raw Nemotron proposed reading a directory `src/auth/` when given an ambiguous error (1/5, 20.0%). Alienese safely abstained to an assistant clarification (0/5, 0.0%).
-- *Scope note:* This experiment evaluated 5 targeted one-turn safety scenarios. In addition, the separate 35-case candidate-recall evaluation across train, dev, and held-out test splits demonstrated an Oracle Recall@1 lift from 33.3% to 88.9% on held-out test cases (+55.6% lift).
+- *Scope note:* This targeted experiment evaluated five specific one-turn safety edge cases. In addition, the separate 35-case candidate-recall evaluation across train, dev, and held-out test splits demonstrated an Oracle Recall@1 lift from 33.3% to 88.9% on held-out test cases (+55.6% lift).
 
 ---
 
 ## Nebius & NVIDIA Platform Feedback
 
 1. **Nebius Token Factory:**
-   - **Throughput & Latency:** Generating 860 tokens with Nemotron 3 Super in ~834 ms was remarkably fast and consistent. The regional `us-central1.nebius.com` endpoint delivered ultra-low network overhead.
+   - **Throughput & Latency:** Generating 2,273 tokens with Nemotron 3 Super in ~1.9s was remarkably fast and consistent. The regional `us-central1.nebius.com` endpoint delivered ultra-low network overhead.
    - **OpenAI Protocol Alignment:** Nebius's standard OpenAI `/v1/chat/completions` API schema allowed seamless integration without bespoke proprietary SDKs.
    - **Zero-Thinking Control:** The `chat_template_kwargs={"enable_thinking": False}` flag worked reliably to suppress unnecessary reasoning bloat on direct code generation tasks.
    - **Recommendation:** Exposing structured JSON schema constraint enforcement directly on the server side would eliminate post-generation JSON extraction edge cases.
 
 2. **NVIDIA Nemotron 3 Super:**
-   - **Code Synthesis Quality:** Nemotron accurately understood Python TTL offset bugs, replaced invalid subtraction logic with `time.time()`, and produced clean, syntax-valid Python code on the first attempt without regression.
+   - **Code Synthesis Quality:** Nemotron accurately understood cross-module session rotation and stale token states, produced clean, syntax-valid Python code on the first attempt without regression.
    - **Instruction Following:** Excellent adherence to output format instructions when prompts provide clear boundaries.
 
 ---
@@ -77,14 +81,14 @@ We evaluated unconstrained Raw Nemotron directly against Alienese on Nebius Toke
 - **Phase 0/1:** Built the core runtime foundation, OpenAI protocol normalization, 4-tier trust model, and deterministic SHA-256 state reconstruction.
 - **Phase 2:** Implemented the remote provider runtime with deadline budgets, single-probe circuit breakers, and Nebius Token Factory integration.
 - **Phase 3:** Engineered the deterministic evidence grounding subsystem and golden evaluation corpus (35 decision points, +55.6% Recall@1 lift).
-- **Final Sprint:** Converted repair workflows to genuine Nemotron code generation, hardened harness workspace isolation (`Path.is_relative_to`), verified all context labeling, and produced synchronized audio screencast assets and a public trace viewer.
+- **Judge & Integration Sprint:** Added cross-module integration challenge (`auth/session_manager.py` + `auth/token_store.py`), judge quickstart guide, multi-task CLI runner, and strict subprocess secret sanitization.
 
 ---
 
 ## Links & Submission Assets
 - **GitHub Repository:** https://github.com/samat2003/nebius-hack (Public, MIT License)
 - **Interactive Trace Viewer Demo:** https://samat2003.github.io/nebius-hack/ (Read-only replay viewer)
-- **Demo Video Asset:** `docs/alienese_demo_screencast.mp4` (Included in GitHub Releases)
-- **Live Run Report:** `results/live_run_report.json` (1,784 ms end-to-end)
-- **Safety Benchmark Report:** `results/benchmark_report.md` (One-Turn Tool Safety)
-- **Release Tag:** `v0.1.1-submission`
+- **Judge Quickstart Guide:** `docs/JUDGE_QUICKSTART.md` (30-second offline evaluation guide)
+- **Live Run Report:** `results/live_run_report.json` (3,382 ms end-to-end, cross-module integration)
+- **Safety Benchmark Report:** `results/benchmark_report.md` (Five targeted safety cases)
+- **Release Tag:** `v0.1.3-submission`

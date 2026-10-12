@@ -13,7 +13,7 @@ Coding agents often fail acutely in production: unconstrained LLMs hallucinate n
 - 📖 **Judge Quickstart Guide:** [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md)
 - 📊 **Live Run Report:** [results/live_run_report.json](results/live_run_report.json)
 - 🛡️ **Comparative Safety Benchmark:** [results/benchmark_report.md](results/benchmark_report.md)
-- 📦 **Latest Release:** [v0.1.1-submission](https://github.com/samat2003/nebius-hack/releases)
+- 📦 **Latest Release:** [v0.1.3-submission](https://github.com/samat2003/nebius-hack/releases)
 
 ---
 
@@ -57,7 +57,7 @@ python scripts/run_coding_task.py --task integration --live --out results/live_r
 
 Standard coding agents ask a large LLM to freely generate tool names and JSON arguments. When an error occurs, the model guesses file locations and commands.
 
-Alienese separates responsibility: code extracts deterministic facts, policy ranks bounded candidates, and the model handles narrow code synthesis.
+Alienese separates responsibility: code extracts deterministic facts, policy ranks bounded candidates, and the model handles narrow code synthesis within harness-constrained boundaries.
 
 ```text
 [Failing Test Traceback]
@@ -73,15 +73,23 @@ Alienese separates responsibility: code extracts deterministic facts, policy ran
                         │
                         ▼
 ┌───────────────────────────────────────────────┐
-│ 2. Grounded Controller Decision               │
+│ 2. Grounded Controller Decision (Turn 1)      │
 │    - Selects grounded action from candidate   │
-│      set (e.g., read_file tests/test_sess.py) │
+│      set (read_file tests/test_session.py)    │
 │    - Produces SHA-256 state digest & trace    │
 └───────────────────────┬───────────────────────┘
                         │
                         ▼
 ┌───────────────────────────────────────────────┐
-│ 3. NVIDIA Nemotron 3 Super (Nebius Factory)   │
+│ 3. Harness-Constrained Context Inspection     │
+│    - Reads imported modules from sandbox      │
+│      (auth/token_store.py & session_manager)  │
+│    - Verifies path containment & allowlists   │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│ 4. NVIDIA Nemotron 3 Super (Nebius Factory)   │
 │    - Receives labeled test + source context   │
 │    - Synthesizes targeted Python repair       │
 │    - Validated via AST syntax compilation     │
@@ -89,26 +97,29 @@ Alienese separates responsibility: code extracts deterministic facts, policy ran
                         │
                         ▼
 ┌───────────────────────────────────────────────┐
-│ 4. Verification & Independent Acceptance Check│
+│ 5. Verification & Independent Acceptance Check│
 │    - Strict sandbox applies diff to workspace │
 │    - Re-runs target suite (RED ➔ GREEN)       │
 │    - Re-runs independent unseen acceptance    │
+│    - Generates diff-grounded explanation      │
 └───────────────────────────────────────────────┘
 ```
 
 ### A Real Trace Walkthrough (`--task integration`)
-1. **Failure Evidence:** Initial pytest run fails on `test_session_refresh_lifecycle` in `tests/test_session.py`.
-2. **Deterministic Grounding:** Alienese intercepts the traceback, extracts `tests/test_session.py`, and inspects imports to discover dependencies (`auth/token_store.py` and `auth/session_manager.py`).
-3. **Safe Tool Selection:** Alienese executes grounded reads within the workspace sandbox; path escapes and test modifications are strictly prohibited.
-4. **Nemotron Code Synthesis:** `nvidia/nemotron-3-super-120b-a12b` on Nebius Token Factory receives the failure traceback and source files, synthesizing the missing session update:
+1. **Failure Evidence:** Initial pytest run fails on `test_session_refresh_lifecycle` in `tests/test_session.py` (`AssertionError`).
+2. **Deterministic Grounding (Alienese Turn 1):** Alienese intercepts the traceback, bounds candidates ($K=1$), and executes `read_file("tests/test_session.py")` with SHA-256 state provenance.
+3. **Context Inspection (Harness-Constrained):** Harness inspects test imports and reads cross-module dependencies (`auth/token_store.py` and `auth/session_manager.py`) within sandbox allowlists.
+4. **Nemotron Code Synthesis (Turn 2):** `nvidia/nemotron-3-super-120b-a12b` on Nebius Token Factory receives the failure traceback and source files, synthesizing the missing session update:
    ```diff
-          self.token_store.revoke_token(old_token_id)
-   -      # BUG: session["active_token_id"] was not updated to new_token_id
+          old_token = self.token_store.get_token(old_token_id)
+          if old_token is None:
+              return None
+   +      # Update active token ID in session to reflect the new token
    +      session["active_token_id"] = new_token_id
-          return session
    ```
-5. **Test & Acceptance Verification:** Sandboxed harness verifies that all 3 unit tests pass and both independent unseen acceptance tests pass.
-6. **Replay Trace:** Full execution telemetry, token usage, and SHA-256 state digests are logged transparently to `results/live_run_report.json`.
+5. **Test & Acceptance Verification (Turn 3):** Sandboxed harness verifies all 3 unit tests pass and both independent unseen acceptance tests pass (5/5 tests).
+6. **Diff-Grounded Post-Mortem (Turn 4):** Nebius Nemotron receives the verified diff and generates a 2-sentence explanation accurately identifying the stale active token pointer and resolution.
+7. **Replay Trace:** Full execution telemetry, token usage, and SHA-256 state digests are logged transparently to `results/live_run_report.json`.
 
 ---
 
@@ -116,19 +127,19 @@ Alienese separates responsibility: code extracts deterministic facts, policy ran
 
 ### A. Live Autonomous Coding Workflows (Nebius Token Factory)
 
-| Metric | Challenge 2: Integration Debugging (`--task integration`) | Challenge 1: Single-Module Expiry (`--task token`) |
+| Metric | Challenge 2: Integration Debugging (`--task integration`) [Primary] | Challenge 1: Single-Module Expiry (`--task token`) [Baseline] |
 |---|---|---|
 | **Task Description** | Cross-module session manager and token store refresh regression | Single-module token TTL past-offset expiration bug |
 | **Modules Involved** | `auth/session_manager.py` + `auth/token_store.py` | `auth/token.py` |
-| **End-to-End Latency** | **3,504 ms** | **1,981 ms** |
-| **Nemotron Generation Latency** | **1,902 ms** | **744 ms** |
-| **Tokens Consumed** | 2,276 total (522 completion) | 850 total (134 completion) |
+| **End-to-End Latency** | **3,382 ms** | **1,981 ms** |
+| **Nemotron Generation Latency** | **1,936 ms** | **744 ms** |
+| **Tokens Consumed** | 2,273 total (536 completion) | 850 total (134 completion) |
 | **Target Test Suite** | 3 passed (100%) | 1 passed (100%) |
 | **Unseen Acceptance Suite** | 2 passed (100%) | 1 passed (100%) |
 | **Overall Status** | **SUCCESS** | **SUCCESS** |
 
 ### B. One-Turn Tool-Argument Safety Evaluation (Raw Nemotron vs. Alienese)
-Evaluated across 5 targeted adversarial and ambiguous one-turn scenarios (`results/benchmark_report.md`):
+Evaluated across five targeted one-turn safety scenarios (`results/benchmark_report.md`):
 
 | Safety Metric | Raw Nemotron (Direct) | Alienese + Nebius |
 |---|---|---|
@@ -137,7 +148,7 @@ Evaluated across 5 targeted adversarial and ambiguous one-turn scenarios (`resul
 | **Action Space Bounding** | Unbounded | **Bounded ($K \le 8$)** |
 | **State Provenance** | None | **SHA-256 Digest** |
 
-*Evaluation limitation note: This targeted safety benchmark measures 5 specific edge scenarios.*
+*Evaluation limitation note: This targeted safety benchmark measures five specific edge scenarios.*
 
 ### C. 35-Case Golden Grounding Corpus Evaluation
 Evaluated against 35 curated coding decision points across train, dev, and held-out test splits (`tests/fixtures/grounding/decision_points.json`):

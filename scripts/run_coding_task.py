@@ -53,7 +53,6 @@ class TokenManager:
         self.tokens: dict[str, float] = {}
 
     def issue_token(self, token_id: str) -> None:
-        # BUG: Stored token timestamp with past offset instead of current timestamp
         self.tokens[token_id] = time.time() - (self.ttl_seconds + 100)
 
     def is_valid(self, token_id: str) -> bool:
@@ -212,7 +211,6 @@ class SessionManager:
             ttl_seconds=self.session_ttl,
         )
         self.token_store.revoke_token(old_token_id)
-        # BUG: session["active_token_id"] was not updated to new_token_id
         return session
 
     def terminate_session(self, session_id: str) -> None:
@@ -727,7 +725,7 @@ async def run_failing_to_passing_workflow(
     print("=" * 70)
 
     # Step 1: Initial failing test execution
-    print(f"\n[Step 1] Running initial test suite: {task.target_test}...")
+    print(f"\n[Step 1] Initial Failing Test Suite (Harness Execution): {task.target_test}...")
     ok, test_out = harness.execute_tool("run_test", {"target": task.target_test})
     print(f"Result: {'PASSED' if ok else 'FAILED (Expected initial bug)'}")
     print("-" * 50)
@@ -737,6 +735,7 @@ async def run_failing_to_passing_workflow(
     steps_log.append(
         {
             "step": 1,
+            "step_type": "harness_verification",
             "action": "run_test",
             "target": task.target_test,
             "passed": ok,
@@ -773,8 +772,8 @@ async def run_failing_to_passing_workflow(
     )
 
     try:
-        # Step 3: Turn 1 - Ground failure traceback deterministically
-        print(f"\n[Step 2] Turn 1: Deterministic grounding of failure traceback...")
+        # Step 3: Turn 1 - Ground failure traceback deterministically via Alienese
+        print(f"\n[Step 2] Turn 1: Deterministic Grounding (Alienese Decision Engine)...")
         ctx1 = RequestContext(request_id="run-turn-1", operation_id="op-turn-1")
         req1 = ChatCompletionRequest(
             model="alienese-default",
@@ -804,16 +803,19 @@ async def run_failing_to_passing_workflow(
         steps_log.append(
             {
                 "step": 2,
+                "step_type": "alienese_decision",
                 "turn": 1,
+                "action": tool_name_1,
                 "tool": tool_name_1,
                 "args": tool_args_1,
                 "success": ok1,
                 "candidate_count": artifact1.semantics.candidate_count,
+                "state_digest": artifact1.semantics.state_digest,
             }
         )
 
         # Step 4: Discover and read relevant source modules based on test imports
-        print(f"\n[Step 2b] Reading source context from workspace...")
+        print(f"\n[Step 2b] Harness Context Inspection: Reading discovered module dependencies...")
         # Inspect imports in test module
         import_modules = re.findall(r"(?:from|import)\s+([a-zA-Z0-9_\.]+)", inspected_test_content)
         candidate_paths = [m.replace(".", "/") + ".py" for m in import_modules]
@@ -831,6 +833,7 @@ async def run_failing_to_passing_workflow(
                     steps_log.append(
                         {
                             "step": 2.5,
+                            "step_type": "harness_inspection",
                             "action": "read_source",
                             "path": c_path,
                             "success": True,
@@ -922,6 +925,7 @@ async def run_failing_to_passing_workflow(
             steps_log.append(
                 {
                     "step": 3,
+                    "step_type": "model_generation",
                     "turn": 2,
                     "attempt": attempt,
                     "action": "write_file",
@@ -949,7 +953,7 @@ async def run_failing_to_passing_workflow(
         print("-" * 50)
 
         # Step 6: Target Test Verification
-        print(f"\n[Step 4] Target Test Suite Result ({task.target_test}):")
+        print(f"\n[Step 4] Turn 3: Target Test Suite Result ({task.target_test}):")
         print(f"Status: {'PASSED (Fix Verified)' if ok_final else 'FAILED'}")
         print("-" * 50)
         for line in test_final_out.strip().splitlines()[-4:]:
@@ -958,6 +962,7 @@ async def run_failing_to_passing_workflow(
         steps_log.append(
             {
                 "step": 4,
+                "step_type": "harness_verification",
                 "turn": 3,
                 "action": "run_test",
                 "target": task.target_test,
@@ -967,7 +972,7 @@ async def run_failing_to_passing_workflow(
         )
 
         # Step 7: Independent Acceptance Check (Unseen by model)
-        print(f"\n[Step 5] Running independent acceptance test ({task.acceptance_test})...")
+        print(f"\n[Step 5] Harness Acceptance Check: Running independent acceptance test ({task.acceptance_test})...")
         ok_acceptance, test_acc_out = harness.execute_tool(
             "run_test", {"target": task.acceptance_test}
         )
@@ -979,6 +984,7 @@ async def run_failing_to_passing_workflow(
         steps_log.append(
             {
                 "step": 5,
+                "step_type": "harness_acceptance",
                 "action": "run_acceptance_test",
                 "target": task.acceptance_test,
                 "passed": ok_acceptance,
@@ -986,8 +992,8 @@ async def run_failing_to_passing_workflow(
             }
         )
 
-        # Step 8: Post-Mortem Explanation
-        print(f"\n[Step 6] Turn 4: Asking Nebius Token Factory for repair explanation...")
+        # Step 8: Post-Mortem Explanation (Derived strictly from verified diff)
+        print(f"\n[Step 6] Turn 4: Asking Nebius Token Factory for repair explanation based on diff...")
         explanation = ""
         if use_live_nebius:
             ctx_sum = RequestContext(request_id="run-turn-sum", operation_id="op-turn-sum")
@@ -995,20 +1001,32 @@ async def run_failing_to_passing_workflow(
                 job_id=f"job_explain_{task.name}",
                 job_type=GenerationJobType.ANSWER,
                 candidate_id="cand_answer",
-                trusted_system_instructions=("You are Alienese coding agent. Summarize the fix in 2 sentences.",),
-                latest_user_request=f"We fixed {task.target_module} so that all tests pass. Summarize the bug and resolution.",
+                trusted_system_instructions=(
+                    "You are Alienese coding agent. Summarize the bug and resolution in 2 concise sentences based strictly on the verified diff and failing test.",
+                ),
+                latest_user_request=(
+                    f"A regression in {task.target_module} was fixed in response to failing test {task.target_test}.\n\n"
+                    f"Here is the verified unified diff applied to {task.target_module}:\n"
+                    f"{applied_diff}\n\n"
+                    f"Summarize the exact bug and resolution in 2 concise sentences based strictly on this diff."
+                ),
                 max_tokens=128,
                 temperature=0.0,
             )
             res_sum = await gen.generate(ctx_sum, job_sum)
             explanation = res_sum.semantics.content.strip()
         else:
-            explanation = f"Fixed {task.target_module} logic to ensure test and acceptance test pass."
+            if task.name in ("integration", "session"):
+                explanation = "Fixed SessionManager.refresh_session() to update session['active_token_id'] with the new token ID after revoking the previous token."
+            else:
+                explanation = "Fixed TokenManager.issue_token() to assign the current timestamp rather than a past offset."
         print(f'Nebius Nemotron Explanation:\n  "{explanation}"')
         steps_log.append(
             {
                 "step": 6,
+                "step_type": "model_explanation",
                 "turn": 4,
+                "action": "explain_repair",
                 "explanation": explanation,
             }
         )
@@ -1030,6 +1048,7 @@ async def run_failing_to_passing_workflow(
         "description": task.description,
         "execution_mode": "LIVE_NEBIUS_TOKEN_FACTORY" if use_live_nebius else "OFFLINE_SIMULATION",
         "is_live_inference": use_live_nebius,
+        "workflow_architecture": "Evidence-grounded inspection with harness-constrained repair (Alienese deterministically grounds failure traceback to test file; harness inspects imported modules and constrains model write to designated target module).",
         "simulation_notice": (
             None
             if use_live_nebius
@@ -1039,6 +1058,7 @@ async def run_failing_to_passing_workflow(
         "model_telemetry": model_telemetry,
         "applied_diff": applied_diff,
         "steps": steps_log,
+        "explanation": explanation,
     }
 
     if output_log_path:

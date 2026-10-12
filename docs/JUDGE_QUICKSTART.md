@@ -51,9 +51,11 @@ python scripts/run_coding_task.py --task integration --live --out results/live_r
 ```
 
 **Observed Live Metrics:**
-- **End-to-End Workflow Latency:** ~3,500 ms.
-- **Nemotron Generation Latency:** ~1,900 ms (2,276 total tokens, 522 completion tokens).
+- **End-to-End Workflow Latency:** 3,382 ms.
+- **Nemotron Generation Latency:** 1,935.8 ms (2,273 total tokens, 536 completion tokens).
 - **Patch Verification:** All 3 target tests and 2 independent acceptance tests pass.
+- **Workflow Architecture:** Evidence-grounded inspection with harness-constrained repair (Alienese deterministically grounds failure traceback to test file; harness inspects imported modules and constrains model write to designated target module).
+- **Post-Mortem Explanation:** Derived strictly from verified diff, correctly explaining the stale active token reference and session update without contradiction.
 - **Transparent Output:** Complete step-by-step trace and unified diff written to stdout and `results/live_run_report.json`.
 
 ---
