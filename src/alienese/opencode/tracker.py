@@ -659,8 +659,21 @@ class OpenCodeSessionTracker:
             return None
 
         # 3. Query mini-Jev Controller for next action choice
-        top_file = ranked_files[0][0] if ranked_files else "auth/session_manager.py"
-        test_file = next((f[0] for f in candidate_files if "test" in f[0]), "tests/test_session.py")
+        if ranked_files:
+            top_file = ranked_files[0][0]
+        elif candidate_files:
+            top_file = candidate_files[0][0]
+        elif (self.workspace / "src/alienese/providers/runtime/client.py").is_file():
+            top_file = "src/alienese/providers/runtime/client.py"
+        else:
+            top_file = "auth/session_manager.py"
+
+        test_file = next(
+            (f[0] for f in candidate_files if "test" in f[0]),
+            "tests/unit/test_provider_runtime.py"
+            if (self.workspace / "tests/unit/test_provider_runtime.py").is_file()
+            else "tests/test_session.py",
+        )
 
         answer_options = [
             {
@@ -843,12 +856,33 @@ class OpenCodeSessionTracker:
                 "plan_text": f"Error during EmbeddingGemma ranking: {e}",
             }
 
-        top_file = ranked_files[0][0] if ranked_files else "auth/session_manager.py"
+        if ranked_files:
+            top_file = ranked_files[0][0]
+        elif candidate_files:
+            top_file = candidate_files[0][0]
+        elif (self.workspace / "src/alienese/providers/runtime/client.py").is_file():
+            top_file = "src/alienese/providers/runtime/client.py"
+        else:
+            top_file = "auth/session_manager.py"
+
         test_file = next(
             (f[0] for f in candidate_files if "test" in f[0] and "acceptance" not in f[0]),
-            "tests/test_session.py",
+            next(
+                (f[0] for f in candidate_files if "test" in f[0]),
+                "tests/unit/test_provider_runtime.py"
+                if (self.workspace / "tests/unit/test_provider_runtime.py").is_file()
+                else "tests/test_session.py",
+            ),
         )
-        second_file = ranked_files[1][0] if len(ranked_files) > 1 else "auth/token_store.py"
+
+        if len(ranked_files) > 1:
+            second_file = ranked_files[1][0]
+        elif len(candidate_files) > 1:
+            second_file = candidate_files[1][0]
+        elif (self.workspace / "src/alienese/providers/runtime/errors.py").is_file():
+            second_file = "src/alienese/providers/runtime/errors.py"
+        else:
+            second_file = "auth/token_store.py"
 
         # 3. Construct multiple grounded next action options (K >= 2, K <= 8)
         answer_options = [
