@@ -113,11 +113,18 @@ async def test_integration_workflow_offline_simulation() -> None:
 
         # Verify steps and diff
         steps = summary["steps"]
-        step_actions = [s.get("action") or s.get("tool") for s in steps]
+        step_actions = [s.get("tool") or s.get("action") for s in steps]
         assert "run_test" in step_actions
         assert "read_file" in step_actions
         assert "write_file" in step_actions
         assert "run_acceptance_test" in step_actions
+
+        step_types = [s.get("step_type") for s in steps]
+        assert "alienese_decision" in step_types
+        assert "harness_inspection" in step_types
+        assert "model_generation" in step_types
+        assert "harness_verification" in step_types
+        assert "harness_acceptance" in step_types
 
         # Target test and acceptance test passed
         test_step = next(s for s in steps if s["step"] == 4)
@@ -133,3 +140,57 @@ async def test_integration_workflow_offline_simulation() -> None:
         # JSON log was written
         assert log_path.exists()
         assert log_path.stat().st_size > 0
+
+
+def test_repair_prompt_no_answer_leakage_and_acceptance_separation() -> None:
+    """Verifies repair prompt contains NO answer-revealing hints and NO acceptance tests."""
+    task = TASKS["integration"]
+    with tempfile.TemporaryDirectory() as tmp_str:
+        ws = Path(tmp_str)
+        harness = StandaloneCodingHarness(ws, writable_allowlist=task.writable_allowlist)
+        harness.setup_task_repo(task)
+
+        # Execute initial test to get real failure output
+        ok_init, test_out = harness.execute_tool("run_test", {"target": task.target_test})
+        assert not ok_init
+
+        # Ground test file
+        ok_read, test_code = harness.execute_tool("read_file", {"path": task.target_test})
+        assert ok_read
+
+        # Read source modules
+        ok_store, store_code = harness.execute_tool("read_file", {"path": "auth/token_store.py"})
+        ok_sess, sess_code = harness.execute_tool("read_file", {"path": "auth/session_manager.py"})
+        assert ok_store and ok_sess
+
+        # Build prompt exactly as runner does
+        prompt_parts = [
+            "You are an expert Python software engineer.",
+            f"A test failed in the test suite:\n{test_out}\n",
+            f"Here is the content of the failing test file '{task.target_test}':\n{test_code}\n",
+            f"Here is the content of the module 'auth/token_store.py':\n{store_code}\n",
+            f"Here is the content of the module 'auth/session_manager.py':\n{sess_code}\n",
+            f"Fix the bug in '{task.target_module}' so that all tests pass.\n"
+            f"Output ONLY the complete, corrected Python code for '{task.target_module}' "
+            "inside a ```python``` code block.\n"
+            "Do not include any explanation before or after.",
+        ]
+        prompt = "\n".join(prompt_parts)
+
+        # 1. No leaked answer comments
+        assert "# BUG" not in prompt
+        assert "was not updated" not in prompt
+
+        # 2. No leaked solution replacement statement in prompt
+        assert 'session["active_token_id"] = new_token_id' not in prompt
+        assert "session['active_token_id'] = new_token_id" not in prompt
+
+        # 3. Acceptance tests strictly excluded
+        assert "test_session_multi_refresh_continuity" not in prompt
+        assert "test_unregistered_session_refresh_rejected" not in prompt
+        assert "tests/test_acceptance.py" not in prompt
+
+        # 4. Context contains authentic buggy code and failing test
+        assert "def test_session_refresh_lifecycle():" in prompt
+        assert "class SessionManager:" in prompt
+        assert "class TokenStore:" in prompt

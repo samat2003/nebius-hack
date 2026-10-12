@@ -171,8 +171,8 @@
     <div class="grid">
       <div class="card">
         <div class="metric-label">Integration Repair Latency (Live E2E)</div>
-        <div class="metric-value">3,504 ms</div>
-        <div class="metric-label">Model generation: 1,902 ms on Nebius Token Factory</div>
+        <div class="metric-value">3,382 ms</div>
+        <div class="metric-label">Model generation: 1,936 ms on Nebius Token Factory</div>
       </div>
       <div class="card">
         <div class="metric-label">Single-Module Repair Latency (Live E2E)</div>
@@ -182,7 +182,7 @@
       <div class="card">
         <div class="metric-label">Out-of-Workspace Path Proposals</div>
         <div class="metric-value" style="color: var(--accent-green);">0 / 5 (0.0%)</div>
-        <div class="metric-label">100% containment verified (Raw Nemotron: 1/5)</div>
+        <div class="metric-label">100% containment across 5 targeted safety cases</div>
       </div>
     </div>
 
@@ -218,21 +218,21 @@
             <td>Deterministic Grounding</td>
             <td><code>read_file("tests/test_session.py")</code></td>
             <td><span style="color: var(--accent-green); font-weight: 600;">GROUNDED</span></td>
-            <td>Traceback-anchored candidate selection (K=1 candidate, SHA-256 digest verified)</td>
+            <td>Alienese Turn 1: Traceback-anchored candidate selection (K=1 candidate, SHA-256 digest verified)</td>
           </tr>
           <tr>
             <td>2b</td>
-            <td>Source Discovery</td>
+            <td>Harness Context Inspection</td>
             <td><code>read_file("auth/token_store.py")</code><br><code>read_file("auth/session_manager.py")</code></td>
             <td><span style="color: var(--accent-green); font-weight: 600;">DISCOVERED</span></td>
-            <td>Test import inspection grounded both cross-module dependencies (3,693 bytes total)</td>
+            <td>Harness inspects test imports to read cross-module dependencies within sandbox allowlist (3,619 bytes)</td>
           </tr>
           <tr>
             <td>3</td>
             <td>Nemotron Code Synthesis</td>
             <td><code>nvidia/nemotron-3-super-120b-a12b</code></td>
             <td><span style="color: var(--accent-green); font-weight: 600;">SYNTHESIZED</span></td>
-            <td>1,902 ms latency, 2,276 tokens (522 completion). Validated via <code>ast.parse()</code></td>
+            <td>1,936 ms latency, 2,273 tokens (536 completion). Validated via <code>ast.parse()</code></td>
           </tr>
           <tr>
             <td>4</td>
@@ -253,7 +253,7 @@
             <td>Post-Mortem Explanation</td>
             <td>Nebius Token Factory</td>
             <td><span style="color: var(--accent-blue); font-weight: 600;">EXPLAINED</span></td>
-            <td>Causal bug explanation synthesized via zero-shot chat completion</td>
+            <td>Derived strictly from verified diff: summarizes stale active token reference and session update</td>
           </tr>
         </tbody>
       </table>
@@ -261,15 +261,16 @@
         <h3 style="font-size: 15px; color: var(--accent-blue); margin-bottom: 8px;">Model-Generated Unified Diff</h3>
         <pre><code>--- a/auth/session_manager.py
 +++ b/auth/session_manager.py
-@@ -55,7 +53,7 @@
-             ttl_seconds=self.session_ttl,
-         )
-         self.token_store.revoke_token(old_token_id)
-<span class="diff-del">-        # BUG: session["active_token_id"] was not updated to new_token_id</span>
-<span class="diff-add">+        session["active_token_id"] = new_token_id</span>
-         return session
+@@ -45,6 +43,9 @@
+         if not old_token_id:
+             return None
  
-     def terminate_session(self, session_id: str) -> None:</code></pre>
+<span class="diff-add">+        # Update active token ID in session to reflect the new token</span>
+<span class="diff-add">+        session["active_token_id"] = new_token_id</span>
++
+         old_token = self.token_store.get_token(old_token_id)
+         if old_token is None:
+             return None</code></pre>
       </div>
     </div>
 
@@ -300,12 +301,12 @@
           </tr>
           <tr>
             <td>Generation Latency</td>
-            <td>1,902 ms</td>
+            <td>1,936 ms</td>
             <td>744 ms</td>
           </tr>
           <tr>
             <td>Total Tokens</td>
-            <td>2,276 tokens</td>
+            <td>2,273 tokens</td>
             <td>850 tokens</td>
           </tr>
           <tr>
@@ -320,7 +321,7 @@
     <!-- BENCHMARKS & EVALUATION -->
     <div class="grid">
       <div class="card">
-        <h2>One-Turn Tool-Argument Safety Evaluation</h2>
+        <h2>One-Turn Tool-Argument Safety Evaluation (Five Targeted Scenarios)</h2>
         <table>
           <thead>
             <tr>
