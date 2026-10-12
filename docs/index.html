@@ -171,8 +171,8 @@
     <div class="grid">
       <div class="card">
         <div class="metric-label">Integration Repair Latency (Live E2E)</div>
-        <div class="metric-value">3,382 ms</div>
-        <div class="metric-label">Model generation: 1,936 ms on Nebius Token Factory</div>
+        <div class="metric-value">3,118 ms</div>
+        <div class="metric-label">Model generation: 2,042 ms on Nebius Token Factory</div>
       </div>
       <div class="card">
         <div class="metric-label">Single-Module Repair Latency (Live E2E)</div>
@@ -232,7 +232,7 @@
             <td>Nemotron Code Synthesis</td>
             <td><code>nvidia/nemotron-3-super-120b-a12b</code></td>
             <td><span style="color: var(--accent-green); font-weight: 600;">SYNTHESIZED</span></td>
-            <td>1,936 ms latency, 2,273 tokens (536 completion). Validated via <code>ast.parse()</code></td>
+            <td>2,042 ms latency, 2,309 tokens (559 completion). Validated via <code>ast.parse()</code></td>
           </tr>
           <tr>
             <td>4</td>
@@ -246,31 +246,44 @@
             <td>Acceptance Verification</td>
             <td><code>pytest tests/test_acceptance.py</code></td>
             <td><span style="color: var(--accent-green); font-weight: 600;">PASSED</span></td>
-            <td>2 passed in 0.01s (Unseen multi-refresh continuity & rejection suites pass)</td>
+            <td>3 passed in 0.01s (Unseen multi-refresh continuity, rejection, & revoked token rollback suites pass)</td>
           </tr>
           <tr>
             <td>6</td>
             <td>Post-Mortem Explanation</td>
             <td>Nebius Token Factory</td>
             <td><span style="color: var(--accent-blue); font-weight: 600;">EXPLAINED</span></td>
-            <td>Derived strictly from verified diff: summarizes stale active token reference and session update</td>
+            <td>Derived strictly from verified diff: summarizes token validation prior to session update and revocation</td>
           </tr>
         </tbody>
       </table>
       <div style="margin-top: 16px;">
         <h3 style="font-size: 15px; color: var(--accent-blue); margin-bottom: 8px;">Model-Generated Unified Diff</h3>
+        <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 8px;">
+          Note: An extra regression test (<code>test_revoked_token_session_refresh_rejected_without_mutation</code>) was added after the previous run to ensure session state is not mutated when refresh is rejected on a revoked token.
+        </p>
         <pre><code>--- a/auth/session_manager.py
 +++ b/auth/session_manager.py
-@@ -45,6 +43,9 @@
+@@ -45,15 +43,20 @@
          if not old_token_id:
              return None
  
-<span class="diff-add">+        # Update active token ID in session to reflect the new token</span>
-<span class="diff-add">+        session["active_token_id"] = new_token_id</span>
-+
+<span class="diff-add">+        # Validate old token exists before proceeding</span>
          old_token = self.token_store.get_token(old_token_id)
          if old_token is None:
-             return None</code></pre>
+             return None
+ 
+<span class="diff-add">+        # Store new token first to ensure it's available</span>
+         self.token_store.store_token(
+             token_id=new_token_id,
+             user_id=session["user_id"],
+             ttl_seconds=self.session_ttl,
+         )
+<span class="diff-add">+        # Update session state</span>
+<span class="diff-add">+        session["active_token_id"] = new_token_id</span>
+<span class="diff-add">+        # Revoke old token after successful update</span>
+         self.token_store.revoke_token(old_token_id)
+         return session</code></pre>
       </div>
     </div>
 
@@ -296,22 +309,22 @@
           </tr>
           <tr>
             <td>Test Suite Size</td>
-            <td>3 behavioral + 2 unseen acceptance</td>
+            <td>3 behavioral + 3 unseen acceptance</td>
             <td>1 unit + 1 unseen acceptance</td>
           </tr>
           <tr>
             <td>Generation Latency</td>
-            <td>1,936 ms</td>
+            <td>2,042 ms</td>
             <td>744 ms</td>
           </tr>
           <tr>
             <td>Total Tokens</td>
-            <td>2,273 tokens</td>
+            <td>2,309 tokens</td>
             <td>850 tokens</td>
           </tr>
           <tr>
             <td>Outcome</td>
-            <td><span style="color: var(--accent-green); font-weight: 600;">PASS (5/5 tests)</span></td>
+            <td><span style="color: var(--accent-green); font-weight: 600;">PASS (6/6 tests)</span></td>
             <td><span style="color: var(--accent-green); font-weight: 600;">PASS (2/2 tests)</span></td>
           </tr>
         </tbody>

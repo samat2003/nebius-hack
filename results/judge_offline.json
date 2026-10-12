@@ -6,7 +6,7 @@
   "is_live_inference": false,
   "workflow_architecture": "Evidence-grounded inspection with harness-constrained repair (Alienese deterministically grounds failure traceback to test file; harness inspects imported modules and constrains model write to designated target module).",
   "simulation_notice": "SIMULATED / REPLAYED - No live model inference was performed.",
-  "elapsed_ms": 732.1,
+  "elapsed_ms": 473.62,
   "model_telemetry": {
     "simulated": true,
     "note": "SIMULATED / REPLAYED - No live model inference was performed.",
@@ -20,7 +20,7 @@
       "action": "run_test",
       "target": "tests/test_session.py",
       "passed": false,
-      "output_summary": "lidate_session\n\ntests/test_session.py:30: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_session.py::test_session_refresh_lifecycle - AssertionError...\n========================= 1 failed, 2 passed in 0.02s ==========================\n"
+      "output_summary": "lidate_session\n\ntests/test_session.py:30: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_session.py::test_session_refresh_lifecycle - AssertionError...\n========================= 1 failed, 2 passed in 0.01s ==========================\n"
     },
     {
       "step": 2,
@@ -33,7 +33,7 @@
       },
       "success": true,
       "candidate_count": 1,
-      "state_digest": "d24ce1a721dc169d848dd2af08412ba5771ac9f7a1df26f9a3e03bebedce693e"
+      "state_digest": "9080c47576c5c30d960406206c255fe6b948251a5d9805cbacae17d4fc11b60d"
     },
     {
       "step": 2.5,
@@ -81,7 +81,7 @@
       "action": "run_acceptance_test",
       "target": "tests/test_acceptance.py",
       "passed": true,
-      "output_summary": "ems\n\ntests/test_acceptance.py::test_session_multi_refresh_continuity PASSED   [ 50%]\ntests/test_acceptance.py::test_unregistered_session_refresh_rejected PASSED [100%]\n\n============================== 2 passed in 0.01s ===============================\n"
+      "output_summary": "tance.py::test_unregistered_session_refresh_rejected PASSED [ 66%]\ntests/test_acceptance.py::test_revoked_token_session_refresh_rejected_without_mutation PASSED [100%]\n\n============================== 3 passed in 0.01s ===============================\n"
     },
     {
       "step": 6,
