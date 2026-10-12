@@ -11,9 +11,11 @@ Coding agents often fail acutely in production: unconstrained LLMs hallucinate n
 
 - 🌐 **Interactive Replay Trace Viewer:** [samat2003.github.io/nebius-hack](https://samat2003.github.io/nebius-hack/)
 - 📖 **Judge Quickstart Guide:** [docs/JUDGE_QUICKSTART.md](docs/JUDGE_QUICKSTART.md)
+- 🔌 **Use with OpenCode Guide:** [docs/OPENCODE_QUICKSTART.md](docs/OPENCODE_QUICKSTART.md)
 - 📊 **Live Run Report:** [results/live_run_report.json](results/live_run_report.json)
+- 📝 **OpenCode Session Trace:** [results/opencode_session_trace.jsonl](results/opencode_session_trace.jsonl)
 - 🛡️ **Comparative Safety Benchmark:** [results/benchmark_report.md](results/benchmark_report.md)
-- 📦 **Latest Release:** [v0.1.4-submission](https://github.com/samat2003/nebius-hack/releases)
+- 📦 **Latest Release:** [v0.1.5-opencode](https://github.com/samat2003/nebius-hack/releases)
 
 ---
 
@@ -50,6 +52,22 @@ export NEBIUS_TOKEN_FACTORY_KEY="your-token-factory-key"
 # Run genuine live repair on the integration challenge
 python scripts/run_coding_task.py --task integration --live --out results/live_run_report.json
 ```
+
+### C. Live OpenCode Product Integration (Autonomous CLI Agent)
+Alienese integrates directly with **OpenCode** (v1.19.0+) via `plugins/opencode/alienese.js`. The plugin intercepts OpenCode's tool execution lifecycle to enforce workspace containment guards, extract tracebacks, compute SHA-256 state digests, and enforce verification obligations before finish:
+
+```bash
+# 1. Install OpenCode CLI
+curl -fsSL https://opencode.ai/install.sh | bash
+
+# 2. Run automated headless evaluation on the cross-module integration challenge
+python scripts/run_opencode_eval.py
+
+# 3. Run OpenCode headlessly with NVIDIA Nemotron 3 Super on Nebius Token Factory
+opencode run --auto -m nebius/nvidia/nemotron-3-super-120b-a12b "Run pytest tests/test_session.py"
+```
+
+See [docs/OPENCODE_QUICKSTART.md](docs/OPENCODE_QUICKSTART.md) for full configuration details and session audit traces.
 
 ---
 
@@ -291,4 +309,4 @@ python scripts/run_coding_task.py --task integration --live --out results/live_r
 - **Model Attribution:** **NVIDIA Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`), utilized for genuine code repair generation and causal bug explanation.
 - **License:** [MIT License](LICENSE)
 - **Work Completed During Hackathon:** The entire Alienese architecture—including the core turn engine, deterministic grounding subsystem, provider runtime with circuit breakers, Nebius Token Factory adapter, 35-case golden evaluation corpus, multi-challenge coding harness, and replay trace viewer—was designed, implemented, and verified during this hackathon sprint.
-- *Scope Note on OpenCode:* OpenCode integration was investigated during the sprint; however, to maintain strict benchmark integrity and avoid unverified harness claims, Alienese currently operates with its own sandboxed runner and OpenAI-compatible API gateway. OpenCode client integration is scheduled for future work.
+- **OpenCode Product Integration:** OpenCode integration is fully implemented and verified via `plugins/opencode/alienese.js` (OpenCode v1.19.0+). The plugin enforces Alienese's deterministic grounding, workspace containment, state derivation, and verification obligations within live interactive and headless OpenCode sessions.
