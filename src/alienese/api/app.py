@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from alienese import __version__
 from alienese.api.chat_completions import build_request_context, router
@@ -27,9 +27,11 @@ from alienese.engine.idempotency import IdempotencyCoordinator
 from alienese.engine.turn import TurnEngine
 from alienese.observability.logging import configure_logging, get_request_logger
 from alienese.observability.tracing import RuntimeTracer
+from alienese.providers.controller.mini_jev import MiniJevController
 from alienese.providers.fake import FakeController, FakeGenerator, FakeRetriever
 from alienese.providers.generator.nebius_token_factory import NebiusTokenFactoryGenerator
 from alienese.providers.generator.nvidia_build import NvidiaBuildGenerator
+from alienese.providers.retriever.embeddinggemma import EmbeddingGemmaRetriever
 from alienese.providers.runtime.circuit_breaker import ProviderCircuitBreaker
 from alienese.providers.runtime.client import ProviderHttpClient
 from alienese.providers.runtime.concurrency import ProviderConcurrencyLimiter
@@ -53,10 +55,10 @@ def _extract_request_context(request: Request) -> RequestContext:
 def build_generator_from_settings(cfg: Settings) -> Generator:
     """Construct the configured Generator provider strictly according to `cfg`."""
     mode = cfg.alienese_provider_mode.strip().lower()
-    if mode == "fake":
+    gen_prov = cfg.generator_provider.strip().lower()
+    if mode == "fake" or gen_prov == "fake":
         return FakeGenerator(model_id=cfg.effective_generator_model)
 
-    gen_prov = cfg.generator_provider.strip().lower()
     resolved_api_key = cfg.effective_generator_api_key
     assert resolved_api_key is not None
 
@@ -103,6 +105,72 @@ def build_generator_from_settings(cfg: Settings) -> Generator:
     )
 
 
+def build_controller_from_settings(cfg: Settings) -> Controller:
+    """Construct the configured Controller provider strictly according to `cfg`."""
+    mode = cfg.alienese_provider_mode.strip().lower()
+    ctrl_prov = cfg.controller_provider.strip().lower()
+    if mode == "fake" or ctrl_prov == "fake":
+        return FakeController(model_id=cfg.controller_model)
+
+    if ctrl_prov == "mini_jev":
+        api_key = cfg.controller_api_key or SecretStr("local")
+        base_url = cfg.controller_base_url or "http://127.0.0.1:8001"
+        http_client = ProviderHttpClient(
+            provider_name="mini_jev",
+            base_url=base_url,
+            api_key=api_key,
+            default_timeout_seconds=cfg.provider_timeout_seconds,
+            allow_localhost_http=True,
+            retry_config=RetryConfig(
+                max_attempts=cfg.provider_max_attempts,
+                retry_ambiguous_failures=cfg.provider_retry_ambiguous,
+            ),
+        )
+        return MiniJevController(
+            http_client=http_client,
+            model_id=cfg.controller_model,
+        )
+
+    raise CompatibilityError(
+        f"Unsupported CONTROLLER_PROVIDER '{cfg.controller_provider}'.",
+        param="controller_provider",
+        code="invalid_provider_mode_combination",
+    )
+
+
+def build_retriever_from_settings(cfg: Settings) -> Retriever:
+    """Construct the configured Retriever provider strictly according to `cfg`."""
+    mode = cfg.alienese_provider_mode.strip().lower()
+    ret_prov = cfg.retriever_provider.strip().lower()
+    if mode == "fake" or ret_prov == "fake":
+        return FakeRetriever(model_id=cfg.retriever_model)
+
+    if ret_prov == "embeddinggemma":
+        api_key = cfg.retriever_api_key or SecretStr("local")
+        base_url = cfg.retriever_base_url or "http://127.0.0.1:8001"
+        http_client = ProviderHttpClient(
+            provider_name="embeddinggemma",
+            base_url=base_url,
+            api_key=api_key,
+            default_timeout_seconds=cfg.provider_timeout_seconds,
+            allow_localhost_http=True,
+            retry_config=RetryConfig(
+                max_attempts=cfg.provider_max_attempts,
+                retry_ambiguous_failures=cfg.provider_retry_ambiguous,
+            ),
+        )
+        return EmbeddingGemmaRetriever(
+            http_client=http_client,
+            model_id=cfg.retriever_model,
+        )
+
+    raise CompatibilityError(
+        f"Unsupported RETRIEVER_PROVIDER '{cfg.retriever_provider}'.",
+        param="retriever_provider",
+        code="invalid_provider_mode_combination",
+    )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -117,8 +185,8 @@ def create_app(
     cfg = settings or Settings()
     configure_logging(cfg.alienese_log_level)
 
-    eff_retriever = retriever or FakeRetriever(model_id=cfg.retriever_model)
-    eff_controller = controller or FakeController(model_id=cfg.controller_model)
+    eff_retriever = retriever or build_retriever_from_settings(cfg)
+    eff_controller = controller or build_controller_from_settings(cfg)
     eff_generator = generator or build_generator_from_settings(cfg)
     eff_idem_store = idempotency_store or InMemoryIdempotencyStore(
         max_entries=cfg.idempotency_max_entries,

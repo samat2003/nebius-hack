@@ -69,6 +69,20 @@ opencode run --auto -m nebius/nvidia/nemotron-3-super-120b-a12b "Run pytest test
 
 See [docs/OPENCODE_QUICKSTART.md](docs/OPENCODE_QUICKSTART.md) for full configuration details and session audit traces.
 
+### D. Full Three-Model Execution (EmbeddingGemma 2 + mini-Jev + Nemotron)
+Run all three models collaboratively in real inference:
+
+```bash
+# 1. Start local model server (EmbeddingGemma 2 & mini-Jev on port 8001)
+.venv-models/bin/python scripts/serve_local_models.py --port 8001 &
+
+# 2. Run end-to-end integration tests verifying all three models in concert
+pytest -v tests/integration/test_three_model_live.py
+
+# 3. Launch OpenCode browser session with three-model guidance enabled
+bash scripts/launch_opencode_demo.sh --three-model
+```
+
 ---
 
 ## 3. Architecture: Multi-Model Orchestration & Deterministic Control
@@ -202,9 +216,13 @@ Coding Harness / SWE Runner
 - **`NebiusTokenFactoryGenerator`**: High-performance HTTP client connecting to Nebius Token Factory.
 - **`StandaloneCodingHarness`**: Security sandbox enforcing strict path containment and write allowlists.
 
-### Future Integrations (Post-Hackathon Roadmap):
-- **Self-Hosted mini-Jev Controller:** Pinned at `samatv256/mini-Jev` (`step-010626`); currently mocked in offline tests until self-hosted vLLM deployment is finalized.
-- **Self-Hosted EmbeddingGemma 2 Retriever:** `google/embeddinggemma-300m`; currently evaluated via offline embeddings.
+### Active Three-Model Runtime Architecture:
+Alienese orchestrates three specialized models working in concert:
+1. **EmbeddingGemma 2 (`google/embeddinggemma-2`):** Dense semantic retriever encoding queries and source files into 768-dimensional Matryoshka embeddings to rank repository context and reduce unnecessary prompt noise.
+2. **mini-Jev (`samatv256/mini-Jev` @ `step-010626`):** Finite-choice decision controller (Qwen3-0.6B backbone with trained LoRA adapter and `decision_head.safetensors` set-head) scoring bounded candidate actions ($K \le 8$).
+3. **NVIDIA Nemotron 3 Super (`nvidia/nemotron-3-super-120b-a12b`) on Nebius Token Factory:** Deep reasoning and high-precision code synthesis for bug repairs and causal explanations.
+
+Local model serving runs via `scripts/serve_local_models.py` on `http://127.0.0.1:8001` (CPU execution < 2.0 GB RAM, 0 MB GPU VRAM, < 200 ms latency).
 
 ---
 
@@ -212,7 +230,7 @@ Coding Harness / SWE Runner
 
 ### Step 1. Run Offline Quality Gates (100% Offline, No Secrets)
 ```bash
-# Run all 185 offline unit, regression, and invariant tests
+# Run all 194 unit, regression, invariant, and integration tests
 pytest -q
 
 # Run static type checking

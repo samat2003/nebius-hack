@@ -118,12 +118,14 @@ class ProviderHttpClient:
         concurrency_limiter: ProviderConcurrencyLimiter | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         allow_insecure_http_for_testing: bool = False,
+        allow_localhost_http: bool = False,
         clock: Callable[[], float] = time.monotonic,
         epoch_clock: Callable[[], float] = time.time,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._provider_name = provider_name
         self._allow_insecure_http_for_testing = allow_insecure_http_for_testing
+        self._allow_localhost_http = allow_localhost_http
         self._clock = clock
         self._epoch_clock = epoch_clock
         self._sleep = sleep_func
@@ -159,7 +161,7 @@ class ProviderHttpClient:
                 code="invalid_provider_base_url",
             )
         if scheme != "https" and not (
-            allow_insecure_http_for_testing
+            (allow_insecure_http_for_testing or allow_localhost_http)
             and scheme == "http"
             and hostname in _ALLOWED_TEST_HTTP_HOSTS
         ):

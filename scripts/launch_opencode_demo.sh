@@ -57,9 +57,14 @@ DO_RESET=0
 DO_STATUS=0
 DO_STOP=0
 FOREGROUND=0
+THREE_MODEL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --three-model)
+      THREE_MODEL=1
+      shift
+      ;;
     --reset)
       DO_RESET=1
       shift
@@ -77,9 +82,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--reset] [--status] [--stop] [--foreground]"
+      echo "Usage: $0 [--three-model] [--reset] [--status] [--stop] [--foreground]"
       echo ""
       echo "Options:"
+      echo "  --three-model Enable three-model runtime: EmbeddingGemma 2 (Retrieval) + mini-Jev (Decision) + Nemotron (Generation)"
       echo "  --reset       Reset demo workspace to pristine failing bug state and restart server"
       echo "  --status      Check if demo server is running and inspect test/trace status"
       echo "  --stop        Stop running OpenCode web server on port 4096"
@@ -178,6 +184,18 @@ export ALIENESE_PYTHON="$VENV_PYTHON"
 export ALIENESE_READ_ONLY_TESTS="1"
 export PATH="$(dirname "$OPENCODE_BIN"):$REPO_ROOT/.venv/bin:$PATH"
 
+# Check or start three-model server if requested
+if [ "$THREE_MODEL" -eq 1 ]; then
+  echo "Checking local model server on port 8001 (EmbeddingGemma 2 + mini-Jev)..."
+  if ! curl -s "http://127.0.0.1:8001/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    echo "Starting local model server on port 8001..."
+    "$REPO_ROOT/.venv-models/bin/python" "$REPO_ROOT/scripts/serve_local_models.py" --port 8001 > "$DEMO_DIR/local_models.log" 2>&1 &
+    sleep 3
+  fi
+  export ALIENESE_THREE_MODEL="1"
+  echo "Three-model architecture active: EmbeddingGemma 2 + mini-Jev + Nemotron 3 Super"
+fi
+
 # Launch OpenCode Web
 cd "$DEMO_DIR"
 
@@ -221,7 +239,12 @@ echo " 3. Default Model:      nebius/nvidia/nemotron-3-super-120b-a12b"
 echo " 4. Provider:           Nebius Token Factory"
 echo " 5. Alienese Plugin:    plugins/opencode/alienese.js (ACTIVE)"
 echo " 6. Test Policy:        ALIENESE_READ_ONLY_TESTS=1 (ENFORCED)"
-echo " 7. Server PID:         $SERVER_PID"
+if [ "$THREE_MODEL" -eq 1 ]; then
+  echo " 7. Three-Model Engine: ACTIVE (EmbeddingGemma 2 + mini-Jev + Nemotron 3 Super)"
+else
+  echo " 7. Mode:               STANDALONE NEMOTRON (Use --three-model for full 3-model demo)"
+fi
+echo " 8. Server PID:         $SERVER_PID"
 echo "------------------------------------------------------------------"
 echo " READY-TO-PASTE PROMPT:"
 echo ' "Run pytest tests/test_session.py to observe the failure, investigate auth/session_manager.py, fix the session refresh bug, and verify tests pass."'

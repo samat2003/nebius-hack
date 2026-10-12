@@ -155,7 +155,8 @@ def check_demo_status(ws: Path) -> dict[str, Any]:
             with urllib.request.urlopen(req, timeout=1) as resp:
                 data = json.loads(resp.read().decode())
                 nemotron_available = any(
-                    m.get("providerID") == "nebius" and "nemotron-3-super" in m.get("id", "")
+                    (m.get("providerID") == "nebius" or m.get("provider") == "nebius")
+                    and "nemotron-3-super" in m.get("id", "").lower()
                     for m in data.get("data", [])
                 )
         except Exception:

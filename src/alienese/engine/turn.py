@@ -660,6 +660,7 @@ class TurnEngine:
         clock: Callable[[], int] | None = None,
         turn_timeout_seconds: float = DEFAULT_TURN_TIMEOUT_SECONDS,
         monotonic_clock: Callable[[], float] | None = None,
+        enable_retrieval: bool | None = None,
     ) -> None:
         self._retriever = retriever
         self._controller = controller
@@ -670,6 +671,13 @@ class TurnEngine:
         self._clock: Callable[[], int] = clock or (lambda: int(time.time()))
         self._turn_timeout_seconds = turn_timeout_seconds
         self._monotonic_clock: Callable[[], float] = monotonic_clock or time.monotonic
+        if enable_retrieval is not None:
+            self._enable_retrieval = enable_retrieval
+        else:
+            self._enable_retrieval = (
+                getattr(retriever, "provider_name", None) == "embeddinggemma"
+                and getattr(controller, "provider_name", None) == "mini_jev"
+            )
 
     @property
     def turn_timeout_seconds(self) -> float:
@@ -686,14 +694,49 @@ class TurnEngine:
         ctx: RequestContext,
         state: WorkingState,
         candidates: Sequence[CandidateAction],
-    ) -> None:
-        """Explicit Phase 3 integration point for retrieval ranking.
+    ) -> Sequence[CandidateAction]:
+        """Rank candidate actions and repository context using Retriever."""
+        if not self._enable_retrieval or len(candidates) <= 1:
+            return candidates
 
-        In Phase 1/2, optional retrieval is bypassed rather than executing a
-        provider call whose ranking output is not consumed by policy selection.
-        """
-        _ = (ctx, state, candidates, self._retriever)
-        return None
+        query = state.latest_user_request or state.initial_user_request or "Select next action"
+        if state.latest_tool_observation is not None:
+            query += f" | observation: {state.latest_tool_observation.content[:200]}"
+
+        from alienese.contracts.providers import RetrievalCandidateItem, RetrievalRequest
+
+        items = tuple(
+            RetrievalCandidateItem(
+                item_id=c.candidate_id,
+                content=(
+                    f"{c.canonical_intent.value}: {c.external_tool_name or ''} {c.rationale or ''}"
+                ),
+                mandatory=(
+                    c.disposition == CandidateDisposition.GENERATION_JOB or c.arguments_complete
+                ),
+            )
+            for c in candidates
+        )
+
+        try:
+            res = await self._retriever.rank(
+                ctx,
+                RetrievalRequest(
+                    query=query,
+                    items=items,
+                    max_results=min(8, len(candidates)),
+                ),
+            )
+            ranked_id_order = [item.item_id for item in res.ranked_items]
+            cand_map = {c.candidate_id: c for c in candidates}
+            reordered = [cand_map[cid] for cid in ranked_id_order if cid in cand_map]
+            for c in candidates:
+                if c not in reordered:
+                    reordered.append(c)
+            return tuple(reordered[:8])
+        except Exception:
+            # Observability must not break inference (AGENTS.md Invariant 13)
+            return candidates
 
     async def execute_turn(
         self,
@@ -754,14 +797,16 @@ class TurnEngine:
                 )
                 logger.info("candidates_constructed", candidate_count=len(candidates))
 
-            # Phase 3 retrieval hook (bypassed in Phase 1/2)
-            await self._maybe_rank_candidates(ctx, state, candidates)
+            # Phase 3 retrieval hook
+            ranked_candidates = await self._maybe_rank_candidates(ctx, state, candidates)
 
             # 4. Controller policy decision
             deadline.require_remaining(provider_name="turn_engine", phase="controller_decide")
             with self._tracer.span("policy.decide") as decide_span:
-                decision: DecisionResult = await self._controller.decide(ctx, state, candidates)
-                candidates_by_id = {c.candidate_id: c for c in candidates}
+                decision: DecisionResult = await self._controller.decide(
+                    ctx, state, ranked_candidates
+                )
+                candidates_by_id = {c.candidate_id: c for c in ranked_candidates}
                 selected = candidates_by_id.get(decision.selected_candidate_id)
                 if selected is None:
                     raise InvalidProviderResponse(
@@ -829,7 +874,7 @@ class TurnEngine:
 
             finish_reason = response.choices[0].finish_reason
             event_digests = _build_event_digests(events)
-            candidate_digests = _build_candidate_digests(candidates)
+            candidate_digests = _build_candidate_digests(ranked_candidates)
             response_sha256 = _canonical_sha256(logical_response)
 
             if self._include_replay_content:

@@ -147,6 +147,19 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
         `[Alienese State] Step ${result.step} | Digest: ${digestShort}... | Evidence: ${result.evidence_count} items`
       );
 
+      if (result.three_model_guidance) {
+        if (result.three_model_guidance.retrieval_summary) {
+          console.error(
+            `[Alienese Retrieval: EmbeddingGemma 2] Ranked: ${result.three_model_guidance.retrieval_summary}`
+          );
+        }
+        if (result.three_model_guidance.decision_summary) {
+          console.error(
+            `[Alienese Decision: mini-Jev] Policy Choice: ${result.three_model_guidance.decision_summary}`
+          );
+        }
+      }
+
       if (result.verification_obligation === true) {
         const mutatedList = (result.mutations || []).join(", ") || "source files";
         console.error(

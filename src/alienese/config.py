@@ -26,7 +26,7 @@ from alienese.providers.generator.nvidia_build import (
 )
 
 _LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
-_SUPPORTED_PROVIDER_MODES: frozenset[str] = frozenset({"fake", "hybrid"})
+_SUPPORTED_PROVIDER_MODES: frozenset[str] = frozenset({"fake", "hybrid", "three_model"})
 
 
 class Settings(BaseSettings):
@@ -163,8 +163,8 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="RETRIEVER_API_KEY",
     )
-    retriever_base_url: str | None = Field(
-        default=None,
+    retriever_base_url: str = Field(
+        default="http://127.0.0.1:8001",
         validation_alias="RETRIEVER_BASE_URL",
     )
     retriever_model: str = Field(
@@ -172,7 +172,7 @@ class Settings(BaseSettings):
         validation_alias="RETRIEVER_MODEL",
     )
 
-    # Controller provider (mini-Jev — Fake in Phase 2)
+    # Controller provider (mini-Jev)
     controller_provider: str = Field(
         default="fake",
         validation_alias="CONTROLLER_PROVIDER",
@@ -182,7 +182,7 @@ class Settings(BaseSettings):
         validation_alias="CONTROLLER_API_KEY",
     )
     controller_base_url: str = Field(
-        default="",
+        default="http://127.0.0.1:8001",
         validation_alias="CONTROLLER_BASE_URL",
     )
     controller_model: str = Field(
@@ -298,23 +298,25 @@ class Settings(BaseSettings):
         if mode not in _SUPPORTED_PROVIDER_MODES:
             raise CompatibilityError(
                 f"Unsupported ALIENESE_PROVIDER_MODE '{self.alienese_provider_mode}'. "
-                "Supported modes in Phase 2 are 'fake' and 'hybrid' ('remote' is not yet enabled).",
+                "Supported modes are 'fake', 'hybrid', and 'three_model'.",
                 param="alienese_provider_mode",
                 code="unsupported_provider_mode",
             )
 
-        if self.retriever_provider.strip().lower() != "fake":
+        ret_prov = self.retriever_provider.strip().lower()
+        if ret_prov not in {"fake", "embeddinggemma"}:
             raise CompatibilityError(
-                f"RETRIEVER_PROVIDER='{self.retriever_provider}' is not enabled in Phase 2; "
-                "retriever must remain 'fake'.",
+                f"Unsupported RETRIEVER_PROVIDER '{self.retriever_provider}'. "
+                "Supported options are 'fake' and 'embeddinggemma'.",
                 param="retriever_provider",
                 code="invalid_provider_mode_combination",
             )
 
-        if self.controller_provider.strip().lower() != "fake":
+        ctrl_prov = self.controller_provider.strip().lower()
+        if ctrl_prov not in {"fake", "mini_jev"}:
             raise CompatibilityError(
-                f"CONTROLLER_PROVIDER='{self.controller_provider}' is not enabled in Phase 2; "
-                "controller must remain 'fake'.",
+                f"Unsupported CONTROLLER_PROVIDER '{self.controller_provider}'. "
+                "Supported options are 'fake' and 'mini_jev'.",
                 param="controller_provider",
                 code="invalid_provider_mode_combination",
             )
@@ -332,14 +334,54 @@ class Settings(BaseSettings):
             # .env is populated with remote generator credentials.
             return self
 
-        # mode == "hybrid"
-        if gen_prov not in {"nvidia_build", "nebius_token_factory"}:
-            raise CompatibilityError(
-                f"ALIENESE_PROVIDER_MODE='hybrid' requires GENERATOR_PROVIDER to be "
-                f"'nvidia_build' or 'nebius_token_factory' (got '{self.generator_provider}').",
-                param="generator_provider",
-                code="invalid_provider_mode_combination",
-            )
+        if mode == "three_model":
+            if ret_prov != "embeddinggemma":
+                raise CompatibilityError(
+                    "ALIENESE_PROVIDER_MODE='three_model' requires "
+                    "RETRIEVER_PROVIDER='embeddinggemma'.",
+                    param="retriever_provider",
+                    code="invalid_provider_mode_combination",
+                )
+            if ctrl_prov != "mini_jev":
+                raise CompatibilityError(
+                    "ALIENESE_PROVIDER_MODE='three_model' requires CONTROLLER_PROVIDER='mini_jev'.",
+                    param="controller_provider",
+                    code="invalid_provider_mode_combination",
+                )
+            if gen_prov not in {"nvidia_build", "nebius_token_factory", "fake"}:
+                raise CompatibilityError(
+                    "ALIENESE_PROVIDER_MODE='three_model' requires GENERATOR_PROVIDER to be "
+                    f"'nvidia_build', 'nebius_token_factory', or 'fake' "
+                    f"(got '{self.generator_provider}').",
+                    param="generator_provider",
+                    code="invalid_provider_mode_combination",
+                )
+
+        if mode == "hybrid":
+            if ret_prov != "fake":
+                raise CompatibilityError(
+                    f"RETRIEVER_PROVIDER='{self.retriever_provider}' is not enabled in Phase 2; "
+                    "retriever must remain 'fake'.",
+                    param="retriever_provider",
+                    code="invalid_provider_mode_combination",
+                )
+            if ctrl_prov != "fake":
+                raise CompatibilityError(
+                    f"CONTROLLER_PROVIDER='{self.controller_provider}' is not enabled in Phase 2; "
+                    "controller must remain 'fake'.",
+                    param="controller_provider",
+                    code="invalid_provider_mode_combination",
+                )
+            if gen_prov not in {"nvidia_build", "nebius_token_factory"}:
+                raise CompatibilityError(
+                    f"ALIENESE_PROVIDER_MODE='hybrid' requires GENERATOR_PROVIDER to be "
+                    f"'nvidia_build' or 'nebius_token_factory' (got '{self.generator_provider}').",
+                    param="generator_provider",
+                    code="invalid_provider_mode_combination",
+                )
+
+        if gen_prov == "fake":
+            return self
 
         raw_nvidia_key = (
             self.generator_api_key.get_secret_value().strip()

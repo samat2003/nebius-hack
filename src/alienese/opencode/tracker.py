@@ -23,6 +23,7 @@ from alienese.contracts.events import (
 from alienese.contracts.state import (
     CanonicalCapability,
     ExternalToolBinding,
+    WorkingState,
 )
 from alienese.engine.reconstruct import reconstruct
 from alienese.grounding.extractors.failures import FailureExtractor
@@ -511,7 +512,10 @@ class OpenCodeSessionTracker:
                     self.last_test_passed = False
                     self.verification_obligation = True
 
-        # 5. Persist state and append trace record
+        # 5. Derive three-model guidance if local model server is available
+        three_model_guidance = self._evaluate_three_model_guidance(working_state, output_str)
+
+        # 6. Persist state and append trace record
         self._save_session_state()
 
         result_info = {
@@ -523,6 +527,7 @@ class OpenCodeSessionTracker:
             "last_test_passed": self.last_test_passed,
             "evidence_count": len(self.evidence_log),
             "new_evidence_count": len(new_evidence),
+            "three_model_guidance": three_model_guidance,
         }
 
         self._record_trace(
@@ -577,4 +582,160 @@ class OpenCodeSessionTracker:
             "last_test_passed": self.last_test_passed,
             "evidence_count": len(self.evidence_log),
             "trace_file": str(self.trace_file),
+        }
+
+    def _evaluate_three_model_guidance(
+        self,
+        working_state: WorkingState,
+        last_output: str,
+    ) -> dict[str, Any] | None:
+        """Query local EmbeddingGemma 2 and mini-Jev to derive semantic guidance."""
+        import urllib.request
+
+        # Fast health check with 300ms timeout
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8001/health")
+            with urllib.request.urlopen(req, timeout=0.3) as resp:
+                if resp.status != 200:
+                    return None
+        except Exception:
+            return None
+
+        # 1. Discover repository files for EmbeddingGemma ranking
+        candidate_files: list[tuple[str, str]] = []
+        for p in self.workspace.rglob("*.py"):
+            parts = p.parts
+            if ".alienese" in parts or ".venv" in parts or "__pycache__" in parts:
+                continue
+            try:
+                rel_str = str(p.relative_to(self.workspace)).replace("\\", "/")
+                snippet = p.read_text(encoding="utf-8")[:400]
+                candidate_files.append((rel_str, snippet))
+            except Exception:
+                continue
+
+        if not candidate_files:
+            return None
+
+        query_text = "fix python bug"
+        for ev in reversed(self.evidence_log):
+            if ev.get("category") == "failed_test" or "error" in str(ev.get("value", "")).lower():
+                query_text = str(ev.get("value", ""))[:200]
+                break
+        if query_text == "fix python bug" and last_output:
+            query_text = last_output[:200]
+
+        # 2. Query EmbeddingGemma 2
+        formatted_inputs = [
+            f"task: code retrieval | query: {query_text}",
+            *[f"title: {f[0]} | text: {f[1]}" for f in candidate_files[:8]],
+        ]
+        emb_payload = json.dumps(
+            {
+                "model": "google/embeddinggemma-2",
+                "input": formatted_inputs,
+                "dimensions": 768,
+            }
+        ).encode("utf-8")
+
+        ranked_files: list[tuple[str, float]] = []
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8001/embeddings",
+                data=emb_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                emb_data = json.loads(resp.read().decode("utf-8"))
+                vectors = [item["embedding"] for item in emb_data["data"]]
+                q_vec = vectors[0]
+                for idx, (fpath, _) in enumerate(candidate_files[:8]):
+                    d_vec = vectors[idx + 1]
+                    dot = sum(a * b for a, b in zip(q_vec, d_vec, strict=True))
+                    ranked_files.append((fpath, round(dot, 4)))
+            ranked_files.sort(key=lambda x: -x[1])
+        except Exception:
+            return None
+
+        # 3. Query mini-Jev Controller for next action choice
+        top_file = ranked_files[0][0] if ranked_files else "auth/session_manager.py"
+        test_file = next((f[0] for f in candidate_files if "test" in f[0]), "tests/test_session.py")
+
+        answer_options = [
+            {
+                "id": "act_read",
+                "label": f"read_file: {top_file}",
+                "type": "external_tool",
+                "description": f"Inspect source code of {top_file}",
+            },
+            {
+                "id": "act_test",
+                "label": f"run_command: pytest {test_file}",
+                "type": "external_tool",
+                "description": f"Run verification tests in {test_file}",
+            },
+        ]
+
+        pred_payload = json.dumps(
+            {
+                "model": "samatv256/mini-Jev",
+                "revision": "step-010626",
+                "state": {
+                    "user_goal": query_text,
+                    "summary": (
+                        f"mutations={len(self.mutations)};"
+                        f"verification_needed={self.verification_obligation}"
+                    ),
+                    "environment": {
+                        "available_tool_count": 2,
+                        "mutation_attempted": bool(self.mutations),
+                        "verification_confirmed": not self.verification_obligation,
+                    },
+                    "history": [{"role": "tool", "content": last_output[:300]}],
+                },
+                "question": "Which action should be selected next?",
+                "question_type": "choice",
+                "answer_options": answer_options,
+            }
+        ).encode("utf-8")
+
+        decision_data: dict[str, Any] | None = None
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8001/predict",
+                data=pred_payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                decision_data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+        retrieval_summary = " > ".join(f"{f} ({s})" for f, s in ranked_files[:3])
+        dec_label = decision_data.get("selected_label", "unknown") if decision_data else "unknown"
+        opt_probs = (
+            ", ".join(
+                f"{opt['id']}: {opt['probability']:.2f}" for opt in decision_data.get("options", [])
+            )
+            if decision_data
+            else ""
+        )
+        decision_summary = f"{dec_label} [{opt_probs}]"
+
+        return {
+            "retriever": {
+                "model": "google/embeddinggemma-2",
+                "ranked_files": ranked_files[:5],
+                "summary": retrieval_summary,
+            },
+            "controller": {
+                "model": "samatv256/mini-Jev",
+                "revision": "step-010626",
+                "selected_id": decision_data.get("selected_id") if decision_data else None,
+                "selected_label": dec_label,
+                "options": decision_data.get("options", []) if decision_data else [],
+                "summary": decision_summary,
+            },
+            "retrieval_summary": retrieval_summary,
+            "decision_summary": decision_summary,
         }
