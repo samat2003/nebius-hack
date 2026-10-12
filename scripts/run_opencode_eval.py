@@ -9,6 +9,7 @@ verification obligations, and records the session trace to results/opencode_sess
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -260,6 +261,22 @@ def setup_disposable_workspace(ws: Path) -> None:
     (tests_dir / "test_session.py").write_text(SESSION_TEST_CODE, encoding="utf-8")
     (tests_dir / "test_acceptance.py").write_text(SESSION_ACCEPTANCE_TEST_CODE, encoding="utf-8")
 
+    # Baseline test hashes
+    trace_dir = ws / ".alienese"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    baseline_hashes: dict[str, str] = {}
+    for p in sorted(tests_dir.rglob("*.py")):
+        rel_str = str(p.relative_to(ws)).replace("\\", "/")
+        baseline_hashes[rel_str] = hashlib.sha256(p.read_bytes()).hexdigest()
+    (trace_dir / "test_baseline_hashes.json").write_text(
+        json.dumps(baseline_hashes, indent=2), encoding="utf-8"
+    )
+
+    # Isolated XDG directories
+    (ws / ".xdg" / "data").mkdir(parents=True, exist_ok=True)
+    (ws / ".xdg" / "config").mkdir(parents=True, exist_ok=True)
+    (ws / ".xdg" / "state").mkdir(parents=True, exist_ok=True)
+
     # OpenCode configuration
     plugin_js = REPO_ROOT / "plugins" / "opencode" / "alienese.js"
     opencode_cfg = {
@@ -380,9 +397,21 @@ def main() -> None:
         default=300,
         help="Max seconds for OpenCode execution",
     )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Custom task prompt for OpenCode",
+    )
+    parser.add_argument(
+        "--three-model",
+        action="store_true",
+        help="Enable Alienese three-model orchestration (EmbeddingGemma + mini-Jev)",
+    )
     args = parser.parse_args()
 
     env = load_env()
+    if args.three_model:
+        env["ALIENESE_THREE_MODEL"] = "1"
     opencode_bin = Path.home() / ".opencode" / "bin" / "opencode"
     if not opencode_bin.is_file():
         # Check in PATH
@@ -423,7 +452,16 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[4/6] Launching genuine headless OpenCode with {args.model}...")
-    task_prompt = "Run pytest tests/test_session.py"
+    default_prompt = (
+        "Invoke alienese_plan to retrieve and rank context, inspect auth/session_manager.py, "
+        "repair the token refresh bug, and verify tests pass."
+        if args.three_model
+        else (
+            "Run pytest tests/test_session.py to observe the failure, inspect "
+            "auth/session_manager.py, repair the session refresh bug, and verify tests pass."
+        )
+    )
+    task_prompt = args.prompt or default_prompt
 
     t0 = time.time()
     code_oc, _out_oc, _err_oc = run_command(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -48,27 +49,14 @@ def load_nebius_key() -> str:
     return ""
 
 
-def clean_stale_opencode_sessions() -> None:
-    """Prune stale sessions from opencode.db so the browser UI only shows the demo."""
-    db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
-    if not db_path.is_file():
-        return
-    try:
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute("DELETE FROM session WHERE directory != ?;", (str(DEMO_DIR),))
-        c.execute("DELETE FROM project_directory WHERE directory != ?;", (str(DEMO_DIR),))
-        c.execute("DELETE FROM project WHERE worktree != ? AND id != 'global';", (str(DEMO_DIR),))
-        now_ms = int(time.time() * 1000)
-        c.execute(
-            "INSERT OR REPLACE INTO project_directory (project_id, directory, time_created) "
-            "VALUES ('global', ?, ?);",
-            (str(DEMO_DIR), now_ms),
-        )
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
+def compute_test_hashes(tests_dir: Path) -> dict[str, str]:
+    """Compute deterministic SHA-256 baseline hashes for test files."""
+    hashes: dict[str, str] = {}
+    if tests_dir.is_dir():
+        for p in sorted(tests_dir.rglob("*.py")):
+            rel_str = str(p.relative_to(tests_dir.parent)).replace("\\", "/")
+            hashes[rel_str] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return hashes
 
 
 def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
@@ -78,6 +66,11 @@ def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
 
     ws.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init"], cwd=ws, capture_output=True)
+
+    # Isolated XDG directories for OpenCode sandbox
+    (ws / ".xdg" / "data").mkdir(parents=True, exist_ok=True)
+    (ws / ".xdg" / "config").mkdir(parents=True, exist_ok=True)
+    (ws / ".xdg" / "state").mkdir(parents=True, exist_ok=True)
 
     # Source code
     auth_dir = ws / "auth"
@@ -93,10 +86,15 @@ def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
     (tests_dir / "test_session.py").write_text(SESSION_TEST_CODE, encoding="utf-8")
     (tests_dir / "test_acceptance.py").write_text(SESSION_ACCEPTANCE_TEST_CODE, encoding="utf-8")
 
-    # Clear previous trace
+    # Clear previous trace and compute baseline test hashes
     trace_dir = ws / ".alienese"
     if trace_dir.exists():
         shutil.rmtree(trace_dir)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    baseline_hashes = compute_test_hashes(tests_dir)
+    (trace_dir / "test_baseline_hashes.json").write_text(
+        json.dumps(baseline_hashes, indent=2), encoding="utf-8"
+    )
 
     # Configure OpenCode with Nemotron default model and Alienese plugin
     plugin_js = REPO_ROOT / "plugins" / "opencode" / "alienese.js"
@@ -122,8 +120,6 @@ def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
         },
     }
     (ws / "opencode.json").write_text(json.dumps(opencode_cfg, indent=2), encoding="utf-8")
-
-    clean_stale_opencode_sessions()
 
 
 def check_demo_status(ws: Path) -> dict[str, Any]:
@@ -159,7 +155,9 @@ def check_demo_status(ws: Path) -> dict[str, Any]:
     nemotron_available = False
     if server_pid is not None:
         try:
-            req = urllib.request.Request("http://127.0.0.1:4096/api/model", headers={"User-Agent": "Alienese"})
+            req = urllib.request.Request(
+                "http://127.0.0.1:4096/api/model", headers={"User-Agent": "Alienese"}
+            )
             with urllib.request.urlopen(req, timeout=1) as resp:
                 data = json.loads(resp.read().decode())
                 nemotron_available = any(
@@ -170,6 +168,11 @@ def check_demo_status(ws: Path) -> dict[str, Any]:
         except Exception:
             pass
 
+    isolated_db = ws / ".xdg" / "data" / "opencode" / "opencode.db"
+    global_db = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+    dash_pid = find_dashboard_pid(4097, ws)
+
     return {
         "exists": True,
         "workspace": str(ws),
@@ -179,36 +182,139 @@ def check_demo_status(ws: Path) -> dict[str, Any]:
         "trace_events_count": trace_count,
         "server_running": server_pid is not None,
         "server_pid": server_pid,
+        "dashboard_running": dash_pid is not None,
+        "dashboard_pid": dash_pid,
+        "dashboard_url": "http://127.0.0.1:4097/",
         "nemotron_available": nemotron_available,
+        "isolated_db_present": isolated_db.is_file(),
+        "global_db_present": global_db.is_file(),
+        "global_db_path": str(global_db),
     }
 
 
-def find_server_pid(port: int = 4096) -> int | None:
-    """Find process ID listening on the given port."""
+def find_server_pid(port: int = 4096, ws: Path | None = None) -> int | None:
+    """Find process ID listening on the given port, only if it belongs to demo workspace."""
+    target_ws = (ws or DEMO_DIR).resolve()
+    pid_file = target_ws / "opencode_web.pid"
+    if pid_file.is_file():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, OSError):
+            pass
+
     try:
         proc = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True)
         pids = [int(p) for p in proc.stdout.strip().split() if p.isdigit()]
-        return pids[0] if pids else None
+        for p in pids:
+            try:
+                proc_cwd = Path(os.readlink(f"/proc/{p}/cwd")).resolve()
+                if proc_cwd == target_ws or target_ws in proc_cwd.parents:
+                    return p
+            except OSError:
+                continue
     except Exception:
-        return None
+        pass
+    return None
 
 
-def stop_server(port: int = 4096) -> bool:
-    """Stop server listening on port."""
-    pid = find_server_pid(port)
+def find_dashboard_pid(port: int = 4097, ws: Path | None = None) -> int | None:
+    """Find process ID of dashboard server belonging to demo workspace."""
+    target_ws = (ws or DEMO_DIR).resolve()
+    pid_file = target_ws / "dashboard.pid"
+    if pid_file.is_file():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, OSError):
+            pass
+
+    try:
+        proc = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True)
+        pids = [int(p) for p in proc.stdout.strip().split() if p.isdigit()]
+        for p in pids:
+            try:
+                proc_cwd = Path(os.readlink(f"/proc/{p}/cwd")).resolve()
+                if proc_cwd == target_ws or target_ws in proc_cwd.parents or proc_cwd == REPO_ROOT:
+                    return p
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def stop_dashboard_server(port: int = 4097, ws: Path | None = None) -> bool:
+    """Stop dashboard server if running."""
+    pid = find_dashboard_pid(port, ws)
+    if pid is not None:
+        with contextlib.suppress(OSError):
+            os.kill(pid, 15)
+            time.sleep(0.5)
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        pid_file = (ws or DEMO_DIR) / "dashboard.pid"
+        if pid_file.is_file():
+            with contextlib.suppress(OSError):
+                pid_file.unlink(missing_ok=True)
+        return True
+    return False
+
+
+def start_dashboard_server(ws: Path, port: int = 4097) -> int:
+    """Start Live Visual Dashboard as a detached background daemon."""
+    existing = find_dashboard_pid(port, ws)
+    if existing is not None:
+        return existing
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{REPO_ROOT / 'src'}:{env.get('PYTHONPATH', '')}"
+    log_path = ws / "dashboard.log"
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        p = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "alienese.dashboard.server",
+                "--port",
+                str(port),
+                "--workspace",
+                str(ws),
+            ],
+            cwd=str(ws),
+            env=env,
+            stdout=log_file,
+            stderr=log_file,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    (ws / "dashboard.pid").write_text(str(p.pid), encoding="utf-8")
+    return p.pid
+
+
+def stop_server(port: int = 4096, ws: Path | None = None) -> bool:
+    """Stop demo server and dashboard listening on ports only if running in demo workspace."""
+    stop_dashboard_server(4097, ws)
+    pid = find_server_pid(port, ws)
     if pid is not None:
         with contextlib.suppress(OSError):
             os.kill(pid, 15)
             time.sleep(1)
             with contextlib.suppress(OSError):
                 os.kill(pid, 9)
+        pid_file = (ws or DEMO_DIR) / "opencode_web.pid"
+        if pid_file.is_file():
+            with contextlib.suppress(OSError):
+                pid_file.unlink(missing_ok=True)
         return True
     return False
 
 
 def start_server(ws: Path, port: int = 4096, host: str = "127.0.0.1") -> int:
-    """Start OpenCode Web as a detached background daemon."""
-    existing = find_server_pid(port)
+    """Start OpenCode Web as a detached background daemon inside isolated XDG sandbox."""
+    existing = find_server_pid(port, ws)
     if existing is not None:
         return existing
 
@@ -227,6 +333,20 @@ def start_server(ws: Path, port: int = 4096, host: str = "127.0.0.1") -> int:
         env["NEBIUS_API_KEY"] = key
     env["ALIENESE_PYTHON"] = str(REPO_ROOT / ".venv" / "bin" / "python")
     env["ALIENESE_READ_ONLY_TESTS"] = "1"
+    env["ALIENESE_DEMO_MODE"] = "1"
+    env["ALIENESE_EXPECTED_WORKSPACE"] = str(ws.resolve())
+
+    # Isolated XDG sandbox for OpenCode web server
+    xdg_data = ws / ".xdg" / "data"
+    xdg_config = ws / ".xdg" / "config"
+    xdg_state = ws / ".xdg" / "state"
+    xdg_data.mkdir(parents=True, exist_ok=True)
+    xdg_config.mkdir(parents=True, exist_ok=True)
+    xdg_state.mkdir(parents=True, exist_ok=True)
+    env["XDG_DATA_HOME"] = str(xdg_data)
+    env["XDG_CONFIG_HOME"] = str(xdg_config)
+    env["XDG_STATE_HOME"] = str(xdg_state)
+
     env["PATH"] = f"{opencode_bin.parent}:{REPO_ROOT / '.venv' / 'bin'}:{env.get('PATH', '')}"
 
     log_path = ws / "opencode_web.log"
@@ -269,6 +389,9 @@ def start_server(ws: Path, port: int = 4096, host: str = "127.0.0.1") -> int:
         except Exception:
             pass
 
+    # Start accompanying Live Visual Dashboard on port 4097
+    start_dashboard_server(ws, 4097)
+
     return p.pid
 
 
@@ -294,6 +417,29 @@ def main() -> None:
     # stop-server subcommand
     stop_p = subparsers.add_parser("stop-server", help="Stop background OpenCode web server")
     stop_p.add_argument("--port", type=int, default=4096, help="Port to stop")
+    stop_p.add_argument("--workspace", default=str(DEMO_DIR), help="Workspace directory")
+
+    # find-pid subcommand
+    find_p = subparsers.add_parser("find-pid", help="Find demo server pid")
+    find_p.add_argument("--port", type=int, default=4096, help="Port to check")
+    find_p.add_argument("--workspace", default=str(DEMO_DIR), help="Workspace directory")
+
+    # start-dashboard subcommand
+    start_dash_p = subparsers.add_parser(
+        "start-dashboard", help="Start background dashboard server"
+    )
+    start_dash_p.add_argument("--port", type=int, default=4097, help="Port to listen on")
+    start_dash_p.add_argument("--workspace", default=str(DEMO_DIR), help="Workspace directory")
+
+    # stop-dashboard subcommand
+    stop_dash_p = subparsers.add_parser("stop-dashboard", help="Stop background dashboard server")
+    stop_dash_p.add_argument("--port", type=int, default=4097, help="Port to stop")
+    stop_dash_p.add_argument("--workspace", default=str(DEMO_DIR), help="Workspace directory")
+
+    # find-dashboard-pid subcommand
+    find_dash_p = subparsers.add_parser("find-dashboard-pid", help="Find dashboard server pid")
+    find_dash_p.add_argument("--port", type=int, default=4097, help="Port to check")
+    find_dash_p.add_argument("--workspace", default=str(DEMO_DIR), help="Workspace directory")
 
     # extract-key subcommand
     subparsers.add_parser("extract-key", help="Safely extract Nebius key")
@@ -319,8 +465,32 @@ def main() -> None:
         )
 
     elif args.command == "stop-server":
-        stopped = stop_server(port=args.port)
+        stopped = stop_server(port=args.port, ws=ws)
         print(json.dumps({"server_stopped": stopped}))
+
+    elif args.command == "find-pid":
+        pid = find_server_pid(port=args.port, ws=ws)
+        if pid is not None:
+            sys.stdout.write(str(pid))
+        sys.exit(0 if pid is not None else 1)
+
+    elif args.command == "start-dashboard":
+        pid = start_dashboard_server(ws, port=args.port)
+        print(
+            json.dumps(
+                {"dashboard_started": True, "pid": pid, "url": f"http://127.0.0.1:{args.port}/"}
+            )
+        )
+
+    elif args.command == "stop-dashboard":
+        stopped = stop_dashboard_server(port=args.port, ws=ws)
+        print(json.dumps({"dashboard_stopped": stopped}))
+
+    elif args.command == "find-dashboard-pid":
+        pid = find_dashboard_pid(port=args.port, ws=ws)
+        if pid is not None:
+            sys.stdout.write(str(pid))
+        sys.exit(0 if pid is not None else 1)
 
     elif args.command == "extract-key":
         key = load_nebius_key()

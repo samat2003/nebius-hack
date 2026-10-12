@@ -135,6 +135,10 @@ def test_opencode_three_model_end_to_end_repair(local_model_server_available: bo
         env["ALIENESE_THREE_MODEL"] = "1"
         env["ALIENESE_PYTHON"] = str(REPO_ROOT / ".venv" / "bin" / "python")
         env["ALIENESE_READ_ONLY_TESTS"] = "1"
+        env["ALIENESE_EXPECTED_WORKSPACE"] = str(ws)
+        env["XDG_DATA_HOME"] = str(ws / ".xdg" / "data")
+        env["XDG_CONFIG_HOME"] = str(ws / ".xdg" / "config")
+        env["XDG_STATE_HOME"] = str(ws / ".xdg" / "state")
         env["NEBIUS_API_KEY"] = key
         env["PATH"] = f"{opencode_bin.parent}:{REPO_ROOT / '.venv' / 'bin'}:{env.get('PATH', '')}"
         env["PYTHONPATH"] = f"{REPO_ROOT / 'src'}:{ws}:{env.get('PYTHONPATH', '')}"
@@ -202,6 +206,15 @@ def test_opencode_three_model_end_to_end_repair(local_model_server_available: bo
         assert any("session_manager.py" in m for m in mutations), (
             f"Expected mutation in session_manager.py, got {mutations}"
         )
+
+        # Check: isolated database exists and was used
+        isolated_db = ws / ".xdg" / "data" / "opencode" / "opencode.db"
+        assert isolated_db.is_file(), f"Isolated db must exist at {isolated_db}"
+
+        # Check: context reduction was computed
+        cr = plan_entry["details"].get("context_reduction", {})
+        assert cr.get("reduction_pct", 0) > 0, "Context reduction must be calculated"
+        assert cr.get("total_candidate_tokens", 0) > cr.get("selected_tokens", 0)
 
         # 5. Check tests passed
         proc_unit = subprocess.run(["pytest", "tests/test_session.py", "-v"], cwd=ws)

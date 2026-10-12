@@ -8,10 +8,13 @@
  * Supported OpenCode Version: v1.19.0+
  */
 
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,6 +23,22 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const VENV_PYTHON = path.join(REPO_ROOT, ".venv", "bin", "python");
 const PYTHON_PATH_DIR = path.join(REPO_ROOT, "src");
+
+const PROTECTED_TOOLS = new Set([
+  "read",
+  "read_file",
+  "view_file",
+  "write",
+  "write_file",
+  "write_to_file",
+  "edit",
+  "edit_file",
+  "replace_file_content",
+  "patch",
+  "bash",
+  "run_command",
+  "command",
+]);
 
 function getPythonCmd(workspaceDir) {
   if (process.env.ALIENESE_PYTHON && fs.existsSync(process.env.ALIENESE_PYTHON)) {
@@ -35,7 +54,7 @@ function getPythonCmd(workspaceDir) {
   return "python3";
 }
 
-function invokeBridge(pythonCmd, workspaceDir, args) {
+async function invokeBridge(pythonCmd, workspaceDir, args, timeoutMs = 15000) {
   const env = {
     ...process.env,
     PYTHONPATH: process.env.PYTHONPATH
@@ -43,29 +62,29 @@ function invokeBridge(pythonCmd, workspaceDir, args) {
       : PYTHON_PATH_DIR,
   };
 
-  const res = spawnSync(pythonCmd, ["-m", "alienese.opencode.bridge", ...args], {
-    cwd: workspaceDir,
-    encoding: "utf8",
-    env,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-
-  if (res.error) {
-    console.error("[Alienese Plugin] Bridge execution error:", res.error.message);
-    return null;
-  }
-
-  if (res.status !== 0) {
-    if (res.stderr) {
-      console.error("[Alienese Plugin] Bridge stderr:", res.stderr.trim());
-    }
-    return null;
-  }
-
   try {
-    return JSON.parse(res.stdout.trim());
+    const { stdout, stderr } = await execFileAsync(
+      pythonCmd,
+      ["-m", "alienese.opencode.bridge", ...args],
+      {
+        cwd: workspaceDir,
+        encoding: "utf8",
+        env,
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024,
+      }
+    );
+
+    if (!stdout || !stdout.trim()) {
+      if (stderr) {
+        console.error("[Alienese Plugin] Bridge stderr:", stderr.trim());
+      }
+      return null;
+    }
+
+    return JSON.parse(stdout.trim());
   } catch (err) {
-    console.error("[Alienese Plugin] Failed to parse bridge output:", res.stdout);
+    console.error("[Alienese Plugin] Bridge execution error:", err.message);
     return null;
   }
 }
@@ -75,15 +94,64 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
   const pythonCmd = getPythonCmd(workspaceDir);
 
   console.error("==================================================================");
-  console.error(" [Alienese OpenCode Plugin v0.1.4]");
+  console.error(" [Alienese OpenCode Plugin v0.1.5]");
   console.error(" Mode: Active Enforcement & Deterministic Grounding");
   console.error(` Workspace: ${workspaceDir}`);
   console.error(` Bridge Runtime: ${pythonCmd}`);
+  console.error(" Live Companion Dashboard: http://127.0.0.1:4097/");
   console.error("==================================================================");
 
-  return {
-    tool: {
-      alienese_plan: {
+  // Attempt to use documented OpenCode v1.19 Zod tool helper
+  let toolHelper = null;
+  try {
+    const pluginMod = await import("@opencode-ai/plugin");
+    if (pluginMod && typeof pluginMod.tool === "function") {
+      toolHelper = pluginMod.tool;
+    }
+  } catch {
+    toolHelper = null;
+  }
+
+  const executePlan = async (args, context) => {
+    const goal = args?.goal || "";
+    const sessionID = context?.sessionID || "default";
+    const targetDir = context?.directory || workspaceDir;
+
+    // Strict containment verification
+    if (process.env.ALIENESE_EXPECTED_WORKSPACE) {
+      const expected = path.resolve(process.env.ALIENESE_EXPECTED_WORKSPACE);
+      const actual = path.resolve(targetDir);
+      if (actual !== expected) {
+        return `[Alienese Workspace Mismatch] Expected workspace '${expected}' but received '${actual}'. Rejecting uncontained demo operation.`;
+      }
+    }
+
+    const bridgeArgs = [
+      "plan",
+      "--workspace", targetDir,
+      "--session", sessionID,
+      "--goal", goal,
+    ];
+    const result = await invokeBridge(pythonCmd, targetDir, bridgeArgs, 20000);
+    if (!result) {
+      return "Alienese planning bridge unavailable or timed out.";
+    }
+    if (typeof result === "string") {
+      return result;
+    }
+    return result.plan_text || JSON.stringify(result, null, 2);
+  };
+
+  const planToolDef = toolHelper
+    ? toolHelper({
+        description:
+          "Invoke Alienese's multi-model orchestration engine (EmbeddingGemma 2 retrieval ranking + mini-Jev decision controller) to analyze repository context, rank files, and select the optimal grounded next action. Call this tool before reading or editing code.",
+        args: {
+          goal: toolHelper.schema.string().describe("The coding task, failing test, or bug description to analyze."),
+        },
+        execute: executePlan,
+      })
+    : {
         description:
           "Invoke Alienese's multi-model orchestration engine (EmbeddingGemma 2 retrieval ranking + mini-Jev decision controller) to analyze repository context, rank files, and select the optimal grounded next action. Call this tool before reading or editing code.",
         args: {
@@ -92,26 +160,12 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
             description: "The coding task, failing test, or bug description to analyze.",
           },
         },
-        execute: async (args, context) => {
-          const goal = args?.goal || "";
-          const sessionID = context?.sessionID || "default";
-          const targetDir = context?.directory || workspaceDir;
-          const bridgeArgs = [
-            "plan",
-            "--workspace", targetDir,
-            "--session", sessionID,
-            "--goal", goal,
-          ];
-          const result = invokeBridge(pythonCmd, targetDir, bridgeArgs);
-          if (!result) {
-            return "Alienese planning bridge unavailable.";
-          }
-          if (typeof result === "string") {
-            return result;
-          }
-          return result.plan_text || JSON.stringify(result, null, 2);
-        },
-      },
+        execute: executePlan,
+      };
+
+  return {
+    tool: {
+      alienese_plan: planToolDef,
     },
 
     "tool.execute.before": async (input, output) => {
@@ -120,6 +174,17 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
       const sessionID = input?.sessionID || "default";
       const targetDir = input?.directory || workspaceDir;
       const args = output?.args || {};
+
+      // 1. Strict workspace containment check for demo mode
+      if (process.env.ALIENESE_EXPECTED_WORKSPACE) {
+        const expected = path.resolve(process.env.ALIENESE_EXPECTED_WORKSPACE);
+        const actual = path.resolve(targetDir);
+        if (actual !== expected) {
+          throw new Error(
+            `[Alienese Workspace Mismatch] Expected workspace '${expected}' but received '${actual}'. Rejecting uncontained demo operation.`
+          );
+        }
+      }
 
       const bridgeArgs = [
         "pre-tool",
@@ -135,9 +200,17 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
         bridgeArgs.push("--read-only-tests");
       }
 
-      const decision = invokeBridge(pythonCmd, targetDir, bridgeArgs);
+      const decision = await invokeBridge(pythonCmd, targetDir, bridgeArgs, 15000);
       if (!decision) {
-        // Fallback safely if bridge was unreachable
+        // Fail-closed for protected filesystem and execution tools
+        if (PROTECTED_TOOLS.has(toolName)) {
+          console.error(
+            `[Alienese Fail-Closed] Bridge failed/timed out on protected tool '${toolName}'. Execution blocked.`
+          );
+          throw new Error(
+            `[Alienese Policy Rejection] Bridge execution failed or timed out. Protected tool '${toolName}' blocked (fail-closed).`
+          );
+        }
         return;
       }
 
@@ -171,7 +244,7 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
         "--output", JSON.stringify(outputText),
       ];
 
-      const result = invokeBridge(pythonCmd, targetDir, bridgeArgs);
+      const result = await invokeBridge(pythonCmd, targetDir, bridgeArgs, 15000);
       if (!result) {
         return;
       }
@@ -180,19 +253,6 @@ export const AlienesePlugin = async ({ project, client, directory, worktree }) =
       console.error(
         `[Alienese State] Step ${result.step} | Digest: ${digestShort}... | Evidence: ${result.evidence_count} items`
       );
-
-      if (result.three_model_guidance) {
-        if (result.three_model_guidance.retrieval_summary) {
-          console.error(
-            `[Alienese Retrieval: EmbeddingGemma 2] Ranked: ${result.three_model_guidance.retrieval_summary}`
-          );
-        }
-        if (result.three_model_guidance.decision_summary) {
-          console.error(
-            `[Alienese Decision: mini-Jev] Policy Choice: ${result.three_model_guidance.decision_summary}`
-          );
-        }
-      }
 
       if (result.verification_obligation === true) {
         const mutatedList = (result.mutations || []).join(", ") || "source files";

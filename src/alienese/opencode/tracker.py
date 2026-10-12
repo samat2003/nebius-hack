@@ -7,7 +7,10 @@ during interactive and headless OpenCode sessions.
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -86,6 +89,9 @@ class OpenCodeSessionTracker:
         self.last_test_passed: bool | None = None
         self.state_digest = "0" * 64
         self.evidence_log: list[dict[str, Any]] = []
+        self.plan_executed = False
+        self.last_recommended_action: str | None = None
+        self.last_adherence: dict[str, Any] | None = None
 
         self._failure_extractor = FailureExtractor()
         self._test_extractor = TestExtractor()
@@ -114,6 +120,9 @@ class OpenCodeSessionTracker:
             self.verification_obligation = bool(data.get("verification_obligation", False))
             self.last_test_passed = data.get("last_test_passed")
             self.state_digest = str(data.get("state_digest", "0" * 64))
+            self.plan_executed = bool(data.get("plan_executed", False))
+            self.last_recommended_action = data.get("last_recommended_action")
+            self.last_adherence = data.get("last_adherence")
             self.evidence_log = list(data.get("evidence_log", []))
 
             # Reconstruct raw events
@@ -145,28 +154,127 @@ class OpenCodeSessionTracker:
                     "event_id": ev.event_id,
                     "kind": ev.kind.value,
                     "trust": ev.trust.value,
-                    "content": ev.content[:2048],
+                    "content": redact_value(ev.content[:2048]),
                     "provenance": ev.provenance.model_dump(mode="json"),
                     "tool_name": ev.tool_name,
                     "tool_call_id": ev.tool_call_id,
-                    "tool_arguments": ev.tool_arguments,
+                    "tool_arguments": redact_value(ev.tool_arguments),
                 }
                 for ev in self.events[-50:]  # keep recent 50
             ]
             data = {
                 "session_id": self.session_id,
                 "sequence_no": self.sequence_no,
-                "mutations": self.mutations,
+                "mutations": list(self.mutations),
                 "verification_obligation": self.verification_obligation,
                 "last_test_passed": self.last_test_passed,
                 "state_digest": self.state_digest,
-                "evidence_log": self.evidence_log[-50:],
+                "plan_executed": self.plan_executed,
+                "last_recommended_action": self.last_recommended_action,
+                "last_adherence": self.last_adherence,
+                "evidence_log": redact_value(self.evidence_log[-50:]),
                 "events": serialized_events,
             }
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(redact_value(data), f, indent=2)
         except Exception:
             pass
+
+    def _check_test_hash_integrity(self) -> tuple[bool, str | None]:
+        """Verify test files match the baseline SHA-256 hashes recorded at session start."""
+        hash_file = self.workspace / ".alienese" / "test_baseline_hashes.json"
+        if not hash_file.is_file():
+            return True, None
+        try:
+            baseline = json.loads(hash_file.read_text(encoding="utf-8"))
+            tests_dir = self.workspace / "tests"
+            if not tests_dir.is_dir():
+                return True, None
+            for rel_path_str, expected_hash in baseline.items():
+                test_file = self.workspace / rel_path_str
+                if not test_file.is_file():
+                    return False, f"Test file '{rel_path_str}' was deleted or moved."
+                current_hash = hashlib.sha256(test_file.read_bytes()).hexdigest()
+                if current_hash != expected_hash:
+                    return False, f"Test file '{rel_path_str}' was modified from baseline hash."
+            return True, None
+        except Exception:
+            return True, None
+
+    def _discover_candidate_files(self) -> list[tuple[str, str]]:
+        """Deterministically gather candidate files prioritized by relevance.
+
+        Priority order:
+        1. Files from tracebacks and failure evidence.
+        2. Files imported by test files via AST inspection.
+        3. Alphabetically sorted repository source files.
+        4. Alphabetically sorted test files.
+        """
+        discovered: list[str] = []
+        seen: set[str] = set()
+
+        def add_file(rel: str) -> None:
+            rel_norm = rel.replace("\\", "/").strip("./")
+            p = self.workspace / rel_norm
+            if p.is_file() and rel_norm not in seen:
+                parts = p.parts
+                if not any(x in parts for x in [".alienese", ".venv", "__pycache__", ".git"]):
+                    seen.add(rel_norm)
+                    discovered.append(rel_norm)
+
+        # 1. Traceback / failure files from evidence log
+        for ev in reversed(self.evidence_log):
+            val = str(ev.get("value", ""))
+            for m in re.finditer(r'File "([^"]+\.py)"', val):
+                f_candidate = m.group(1)
+                try:
+                    rel = Path(f_candidate).resolve().relative_to(self.workspace)
+                    add_file(str(rel))
+                except Exception:
+                    add_file(f_candidate)
+            for word in val.split():
+                clean_word = word.strip(":,()[]'\"")
+                if clean_word.endswith(".py"):
+                    add_file(clean_word)
+
+        # 2. AST imports from test files
+        tests_dir = self.workspace / "tests"
+        if tests_dir.is_dir():
+            for t_path in sorted(tests_dir.rglob("*.py")):
+                try:
+                    tree = ast.parse(t_path.read_text(encoding="utf-8"))
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.ImportFrom) and node.module:
+                            mod_rel = node.module.replace(".", "/") + ".py"
+                            add_file(mod_rel)
+                        elif isinstance(node, ast.Import):
+                            for alias in node.names:
+                                mod_rel = alias.name.replace(".", "/") + ".py"
+                                add_file(mod_rel)
+                except Exception:
+                    pass
+
+        # 3. Sorted repository .py files (source code first, then tests)
+        all_py = sorted(self.workspace.rglob("*.py"))
+        source_py = [p for p in all_py if "tests" not in p.parts and not p.name.startswith("test_")]
+        test_py = [p for p in all_py if p not in source_py]
+
+        for p in source_py + test_py:
+            try:
+                rel_path = str(p.relative_to(self.workspace))
+                add_file(rel_path)
+            except Exception:
+                pass
+
+        results: list[tuple[str, str]] = []
+        for rel_str in discovered:
+            p = self.workspace / rel_str
+            try:
+                snippet = p.read_text(encoding="utf-8")[:500]
+                results.append((rel_str, snippet))
+            except Exception:
+                continue
+        return results
 
     def evaluate_pre_tool(
         self,
@@ -198,6 +306,82 @@ class OpenCodeSessionTracker:
             "verification_obligation": self.verification_obligation,
             "call_id": cid,
         }
+
+        # 0. Canonical workspace containment check
+        expected_ws = os.environ.get("ALIENESE_EXPECTED_WORKSPACE")
+        if expected_ws:
+            exp_resolved = Path(expected_ws).resolve()
+            if self.workspace != exp_resolved:
+                decision.update(
+                    {
+                        "allowed": False,
+                        "decision": "REJECT",
+                        "enforced_guard": True,
+                        "guard_name": "workspace_containment",
+                        "reason": (
+                            f"Workspace mismatch: Session running in '{self.workspace}' but "
+                            f"demo mode requires '{exp_resolved}'. "
+                            "Rejecting uncontained demo operation."
+                        ),
+                    }
+                )
+                self._record_trace("PRE_TOOL", tool_name, args, decision)
+                return decision
+
+        # 0b. Test file hash integrity baseline check
+        intact, tamper_msg = self._check_test_hash_integrity()
+        if not intact:
+            decision.update(
+                {
+                    "allowed": False,
+                    "decision": "REJECT",
+                    "enforced_guard": True,
+                    "guard_name": "test_hash_integrity",
+                    "reason": f"Test integrity violation detected: {tamper_msg}",
+                }
+            )
+            self._record_trace("PRE_TOOL", tool_name, args, decision)
+            return decision
+
+        # 0c. Mandatory planning gate in three-model mode
+        three_model_env = os.environ.get("ALIENESE_THREE_MODEL") == "1"
+        unguided_tools = {
+            "glob",
+            "read",
+            "read_file",
+            "view_file",
+            "bash",
+            "run_command",
+            "command",
+            "edit",
+            "edit_file",
+            "write",
+            "write_file",
+            "write_to_file",
+            "replace_file_content",
+        }
+        if (
+            three_model_env
+            and not self.plan_executed
+            and tool_name != "alienese_plan"
+            and tool_name in unguided_tools
+        ):
+            decision.update(
+                {
+                    "allowed": False,
+                    "decision": "REJECT",
+                    "enforced_guard": True,
+                    "guard_name": "mandatory_planning_gate",
+                    "reason": (
+                        "Three-model orchestration is active. You must invoke the "
+                        "'alienese_plan' tool first to retrieve and rank repository context "
+                        "and select the optimal grounded action before inspecting files, "
+                        "running commands, or mutating code."
+                    ),
+                }
+            )
+            self._record_trace("PRE_TOOL", tool_name, args, decision)
+            return decision
 
         # 1. File operation validation
         if raw_target and isinstance(raw_target, str):
@@ -322,8 +506,9 @@ class OpenCodeSessionTracker:
         # 2. Bash command inspection
         elif tool_name in {"bash", "run_command", "command"}:
             cmd = str(args.get("command", "")).strip()
-            # Explicit inspection: detect obvious traversal attempts
-            if "/etc/passwd" in cmd or "/etc/shadow" in cmd:
+
+            # System file access
+            if "/etc/passwd" in cmd or "/etc/shadow" in cmd or "/etc/" in cmd:
                 decision.update(
                     {
                         "allowed": False,
@@ -336,7 +521,61 @@ class OpenCodeSessionTracker:
                 self._record_trace("PRE_TOOL", tool_name, args, decision)
                 return decision
 
-            # Unsupported general shell execution is described as observed / deferred
+            # Secret / credential access
+            if any(sec in cmd for sec in [".env", "id_rsa", "id_ed25519", "credentials"]):
+                decision.update(
+                    {
+                        "allowed": False,
+                        "decision": "REJECT",
+                        "enforced_guard": True,
+                        "guard_name": "protected_file",
+                        "reason": (
+                            "Shell execution targeting protected secret files "
+                            "(.env, keys, credentials) is strictly blocked."
+                        ),
+                    }
+                )
+                self._record_trace("PRE_TOOL", tool_name, args, decision)
+                return decision
+
+            # Workspace escaping check
+            if re.search(r"\bcd\s+(\.\./\.\.|/|~)", cmd) or "rm -rf /" in cmd:
+                decision.update(
+                    {
+                        "allowed": False,
+                        "decision": "REJECT",
+                        "enforced_guard": True,
+                        "guard_name": "workspace_containment",
+                        "reason": (
+                            "Shell command attempting to escape repository "
+                            "workspace root is blocked."
+                        ),
+                    }
+                )
+                self._record_trace("PRE_TOOL", tool_name, args, decision)
+                return decision
+
+            # Test file modification / tampering check
+            if self.read_only_test_files and re.search(
+                r"(?:>|>>)\s*.*tests/|\b(?:rm|mv|cp|truncate|chmod|touch)\s+.*tests/|\bsed\s+.*-i.*tests/",
+                cmd,
+            ):
+                decision.update(
+                    {
+                        "allowed": False,
+                        "decision": "REJECT",
+                        "enforced_guard": True,
+                        "guard_name": "read_only_test_policy",
+                        "reason": (
+                            "Shell command attempting to modify or delete test files "
+                            "is strictly blocked."
+                        ),
+                    }
+                )
+                self._record_trace("PRE_TOOL", tool_name, args, decision)
+                return decision
+
+            # General shell execution is observed by Alienese
             decision.update(
                 {
                     "decision": "OBSERVE",
@@ -347,6 +586,21 @@ class OpenCodeSessionTracker:
                     ),
                 }
             )
+
+        # 3. Plan adherence tracking
+        if self.last_recommended_action:
+            actual_action = f"{tool_name}: {raw_target or args.get('command') or ''}".strip()
+            rec = self.last_recommended_action
+            rec_tool = rec.split(":", 1)[0].strip()
+            rec_arg = rec.split(":", 1)[1].strip() if ":" in rec else ""
+            matched = (tool_name == rec_tool) and (not rec_arg or rec_arg in actual_action)
+            adherence_info = {
+                "recommended": self.last_recommended_action,
+                "actual": actual_action,
+                "matched": matched,
+            }
+            self.last_adherence = adherence_info
+            decision["adherence"] = adherence_info
 
         if decision["allowed"]:
             seq = len(self.events)
@@ -513,8 +767,20 @@ class OpenCodeSessionTracker:
                     self.last_test_passed = False
                     self.verification_obligation = True
 
-        # 5. Derive three-model guidance if local model server is available
-        three_model_guidance = self._evaluate_three_model_guidance(working_state, output_str)
+        # 4b. Test file hash integrity baseline check on post tool
+        intact, tamper_msg = self._check_test_hash_integrity()
+        if not intact:
+            self.evidence_log.append(
+                {
+                    "category": "integrity_violation",
+                    "value": f"Test hash integrity failed: {tamper_msg}",
+                    "provenance": provenance.model_dump(mode="json"),
+                }
+            )
+
+        # 5. Three-model planning is driven on-demand via alienese_plan
+        # Redundant per-tool synchronous model calls removed to preserve speed and avoid loops.
+        three_model_guidance = None
 
         # 6. Persist state and append trace record
         self._save_session_state()
@@ -529,6 +795,7 @@ class OpenCodeSessionTracker:
             "evidence_count": len(self.evidence_log),
             "new_evidence_count": len(new_evidence),
             "three_model_guidance": three_model_guidance,
+            "adherence": self.last_adherence,
         }
 
         self._record_trace(
@@ -562,13 +829,14 @@ class OpenCodeSessionTracker:
                 "state_digest": self.state_digest,
                 "verification_obligation": self.verification_obligation,
                 "mutations": list(self.mutations),
-                "details": decision_or_result,
+                "adherence": self.last_adherence,
+                "details": redact_value(decision_or_result),
             }
             if output_summary is not None:
                 entry["output_summary"] = redact_value(output_summary)
 
             with open(self.trace_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
+                f.write(json.dumps(redact_value(entry)) + "\n")
         except Exception:
             pass
 
@@ -790,23 +1058,23 @@ class OpenCodeSessionTracker:
                 "plan_text": plan_text,
             }
 
-        # 1. Discover candidate python files in workspace
-        candidate_files: list[tuple[str, str]] = []
-        for p in self.workspace.rglob("*.py"):
-            parts = p.parts
-            if (
-                ".alienese" in parts
-                or ".venv" in parts
-                or "__pycache__" in parts
-                or ".git" in parts
-            ):
-                continue
-            try:
-                rel_str = str(p.relative_to(self.workspace)).replace("\\", "/")
-                snippet = p.read_text(encoding="utf-8")[:500]
-                candidate_files.append((rel_str, snippet))
-            except Exception:
-                continue
+        expected_ws = os.environ.get("ALIENESE_EXPECTED_WORKSPACE")
+        if expected_ws:
+            exp_resolved = Path(expected_ws).resolve()
+            if self.workspace != exp_resolved:
+                msg = (
+                    f"Workspace mismatch: Session running in '{self.workspace}' but "
+                    f"demo mode requires '{exp_resolved}'. Rejecting uncontained demo operation."
+                )
+                return {
+                    "status": "error",
+                    "three_model_active": False,
+                    "message": msg,
+                    "plan_text": f"### Alienese Plan Error\n\n{msg}",
+                }
+
+        # 1. Deterministically discover candidate python files in workspace
+        candidate_files = self._discover_candidate_files()
 
         # Determine query text
         query_text = goal.strip()
@@ -856,33 +1124,67 @@ class OpenCodeSessionTracker:
                 "plan_text": f"Error during EmbeddingGemma ranking: {e}",
             }
 
-        if ranked_files:
-            top_file = ranked_files[0][0]
+        # Identify non-test source candidates (never recommend editing test files)
+        source_ranked = [
+            f for f, s in ranked_files if "test" not in f and not Path(f).name.startswith("test_")
+        ]
+        test_candidates = [
+            f for f, s in ranked_files if "test" in f or Path(f).name.startswith("test_")
+        ]
+
+        if source_ranked:
+            top_file = source_ranked[0]
         elif candidate_files:
-            top_file = candidate_files[0][0]
+            top_file = next(
+                (f[0] for f in candidate_files if "test" not in f[0]), candidate_files[0][0]
+            )
         elif (self.workspace / "src/alienese/providers/runtime/client.py").is_file():
             top_file = "src/alienese/providers/runtime/client.py"
         else:
             top_file = "auth/session_manager.py"
 
-        test_file = next(
-            (f[0] for f in candidate_files if "test" in f[0] and "acceptance" not in f[0]),
-            next(
-                (f[0] for f in candidate_files if "test" in f[0]),
-                "tests/unit/test_provider_runtime.py"
-                if (self.workspace / "tests/unit/test_provider_runtime.py").is_file()
-                else "tests/test_session.py",
-            ),
-        )
-
-        if len(ranked_files) > 1:
-            second_file = ranked_files[1][0]
-        elif len(candidate_files) > 1:
-            second_file = candidate_files[1][0]
+        if len(source_ranked) > 1:
+            second_file = source_ranked[1]
+        elif (self.workspace / "auth/token_store.py").is_file():
+            second_file = "auth/token_store.py"
         elif (self.workspace / "src/alienese/providers/runtime/errors.py").is_file():
             second_file = "src/alienese/providers/runtime/errors.py"
         else:
-            second_file = "auth/token_store.py"
+            second_file = top_file
+
+        if test_candidates:
+            test_file = test_candidates[0]
+        else:
+            test_file = next(
+                (f[0] for f in candidate_files if "test" in f[0] and "acceptance" not in f[0]),
+                next(
+                    (f[0] for f in candidate_files if "test" in f[0]),
+                    "tests/test_session.py"
+                    if (self.workspace / "tests/test_session.py").is_file()
+                    else "tests/unit/test_provider_runtime.py",
+                ),
+            )
+
+        # Context reduction calculation
+        total_candidate_chars = sum(
+            len(p.read_text(encoding="utf-8", errors="ignore"))
+            for p in self.workspace.rglob("*.py")
+            if not any(x in p.parts for x in [".alienese", ".venv", "__pycache__", ".git"])
+        )
+        total_candidate_tokens = max(1, total_candidate_chars // 4)
+        selected_chars = sum(
+            len((self.workspace / f).read_text(encoding="utf-8", errors="ignore")[:500])
+            for f in [top_file, second_file, test_file]
+            if (self.workspace / f).is_file()
+        )
+        selected_tokens = max(1, selected_chars // 4)
+        reduction_pct = round((1.0 - (selected_tokens / total_candidate_tokens)) * 100.0, 1)
+        reduction_info = {
+            "total_candidate_tokens": total_candidate_tokens,
+            "selected_tokens": selected_tokens,
+            "reduction_pct": reduction_pct,
+            "formula": "1 - (selected_tokens / total_candidate_tokens)",
+        }
 
         # 3. Construct multiple grounded next action options (K >= 2, K <= 8)
         answer_options = [
@@ -963,14 +1265,43 @@ class OpenCodeSessionTracker:
         )
         options_bullets = "\n".join(
             f"  - `{opt['id']}`: {opt.get('label', opt['id'])} "
-            f"(probability: {opt.get('probability', 0.0):.4f})"
+            f"(Softmax option score: {opt.get('probability', 0.0):.4f})"
             + (" [SELECTED]" if opt["id"] == selected_id else "")
             for opt in options
         )
 
+        # Step directives dynamically follow mini-Jev's actual selected choice
+        if selected_id == "act_run_pytest":
+            step1 = (
+                f"Run verification tests: `pytest {test_file}` via `bash` to observe reproduction."
+            )
+            step2 = f"Use `read` to inspect `{top_file}` at the relevant functions."
+            step3 = (
+                f"Synthesize the fix in `{top_file}` using `edit` (or `write`) "
+                f"and verify with `pytest {test_file}`."
+            )
+        elif selected_id == "act_inspect_dep":
+            step1 = f"Use `read` to inspect dependency module `{second_file}`."
+            step2 = (
+                f"Use `read` to inspect primary module `{top_file}` "
+                "and synthesize the fix using `edit`."
+            )
+            step3 = f"Run `pytest {test_file}` via `bash` to fulfill the verification obligation."
+        else:
+            step1 = f"Use `read` to inspect primary candidate module `{top_file}`."
+            step2 = f"Synthesize the fix in `{top_file}` using `edit` (or `write`)."
+            step3 = (
+                f"Verify your fix by running `pytest {test_file}` via `bash` "
+                "to fulfill the verification obligation."
+            )
+
         plan_text = (
             "### Alienese Multi-Model Orchestration Plan\n\n"
             f"**Objective:** {query_text}\n\n"
+            f"**Context Efficiency:** Candidate reduction: {reduction_pct}% "
+            f"({selected_tokens:,} tokens selected from "
+            f"{total_candidate_tokens:,} total candidate tokens)\n"
+            "**Companion Dashboard:** Real-time metrics streaming at http://127.0.0.1:4097/\n\n"
             "**1. Retrieval Context Ranking "
             "(EmbeddingGemma 2 — 768d Dense Matryoshka Embeddings):**\n"
             f"{ranked_bullets}\n\n"
@@ -978,16 +1309,19 @@ class OpenCodeSessionTracker:
             f"Evaluated {len(answer_options)} grounded candidate actions with trained set-head:\n"
             f"{options_bullets}\n"
             f"- **Selected Policy Action:** `{selected_label}` "
-            f"(confidence: {selected_prob:.1%})\n\n"
+            f"(Softmax option score: {selected_prob:.1%})\n\n"
             "**3. Concrete Directives for Coding Model:**\n"
-            f"- **Step 1:** Use `read` to inspect `{top_file}` at the relevant functions.\n"
-            f"- **Step 2:** Synthesize the fix in `{top_file}` using `edit` (or `write`).\n"
-            f"- **Step 3:** Verify your fix by running `pytest {test_file}` via `bash` "
-            "to fulfill the verification obligation."
+            f"- **Step 1:** {step1}\n"
+            f"- **Step 2:** {step2}\n"
+            f"- **Step 3:** {step3}"
         )
 
-        # 6. Record immutable trace record in opencode_trace.jsonl
+        # 6. Update tracker state & record immutable trace record
         self.sequence_no += 1
+        self.plan_executed = True
+        self.last_recommended_action = selected_label
+        self._save_session_state()
+
         plan_details = {
             "query": query_text,
             "ranked_files": ranked_files,
@@ -995,6 +1329,7 @@ class OpenCodeSessionTracker:
             "selected_id": selected_id,
             "selected_label": selected_label,
             "selected_probability": selected_prob,
+            "context_reduction": reduction_info,
         }
         self._record_trace(
             "ALIENESE_PLAN",
@@ -1014,5 +1349,6 @@ class OpenCodeSessionTracker:
             "selected_id": selected_id,
             "selected_label": selected_label,
             "selected_probability": selected_prob,
+            "context_reduction": reduction_info,
             "plan_text": plan_text,
         }

@@ -4,7 +4,8 @@
 #
 # Launches OpenCode Web (v1.19.0) with Alienese plugin active, bound to
 # NVIDIA Nemotron 3 Super on Nebius Token Factory, inside an isolated
-# disposable workspace (/tmp/alienese_opencode_demo).
+# disposable workspace (/tmp/alienese_opencode_demo), alongside the
+# Live Visual Dashboard (http://127.0.0.1:4097).
 # ==============================================================================
 set -euo pipefail
 
@@ -12,21 +13,37 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="/tmp/alienese_opencode_demo"
 PORT="4096"
 HOST="127.0.0.1"
+DASHBOARD_PORT="4097"
 LOG_FILE="$DEMO_DIR/opencode_web.log"
 PID_FILE="$DEMO_DIR/opencode_web.pid"
+DASHBOARD_PID_FILE="$DEMO_DIR/dashboard.pid"
+DASHBOARD_LOG_FILE="$DEMO_DIR/dashboard.log"
 VENV_PYTHON="$REPO_ROOT/.venv/bin/python"
 
-# Helper: Find process ID listening on port 4096
+# Helper: Find process ID listening on port 4096 strictly belonging to demo workspace
 get_server_pid() {
-  lsof -ti tcp:"$PORT" 2>/dev/null || true
+  "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" find-pid --port "$PORT" --workspace "$DEMO_DIR" 2>/dev/null || true
+}
+
+get_dashboard_pid() {
+  "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" find-dashboard-pid --port "$DASHBOARD_PORT" --workspace "$DEMO_DIR" 2>/dev/null || true
+}
+
+stop_dashboard() {
+  "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" stop-dashboard --port "$DASHBOARD_PORT" --workspace "$DEMO_DIR" >/dev/null 2>&1 || true
+}
+
+start_dashboard() {
+  "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" start-dashboard --port "$DASHBOARD_PORT" --workspace "$DEMO_DIR" >/dev/null 2>&1 || true
 }
 
 # Helper: Stop server listening on port 4096
 stop_server() {
   echo "Stopping server on port $PORT..."
-  "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" stop-server --port "$PORT" >/dev/null 2>&1 || true
+  "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" stop-server --port "$PORT" --workspace "$DEMO_DIR" >/dev/null 2>&1 || true
   rm -f "$PID_FILE"
-  echo "Server stopped."
+  stop_dashboard
+  echo "Server and dashboard stopped."
 }
 
 # Helper: Show demo status
@@ -41,12 +58,22 @@ show_status() {
     if [ -d "/proc/$pid" ]; then
       proc_cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "unknown")
     fi
-    echo " Web Server:       RUNNING (PID: $pid)"
+    echo " OpenCode Web:     RUNNING (PID: $pid)"
     echo " Server Directory: $proc_cwd"
-    echo " Server URL:       http://$HOST:$PORT/"
+    echo " OpenCode URL:     http://$HOST:$PORT/"
   else
-    echo " Web Server:       STOPPED"
+    echo " OpenCode Web:     STOPPED"
   fi
+
+  local dpid
+  dpid=$(get_dashboard_pid)
+  if [ -n "$dpid" ]; then
+    echo " Visual Dashboard: RUNNING (PID: $dpid)"
+    echo " Dashboard URL:    http://$HOST:$DASHBOARD_PORT/"
+  else
+    echo " Visual Dashboard: STOPPED"
+  fi
+
   echo "------------------------------------------------------------------"
   "$VENV_PYTHON" "$REPO_ROOT/scripts/prepare_opencode_demo.py" status --workspace "$DEMO_DIR"
   echo "=================================================================="
@@ -88,7 +115,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --three-model Enable three-model runtime: EmbeddingGemma 2 (Retrieval) + mini-Jev (Decision) + Nemotron (Generation)"
       echo "  --reset       Reset demo workspace to pristine failing bug state and restart server"
       echo "  --status      Check if demo server is running and inspect test/trace status"
-      echo "  --stop        Stop running OpenCode web server on port 4096"
+      echo "  --stop        Stop running OpenCode web server and dashboard"
       echo "  --foreground  Run server in foreground instead of detached background"
       echo "  --help, -h    Show this help message"
       exit 0
@@ -146,9 +173,10 @@ if [ -n "$EXISTING_PID" ]; then
     echo "=================================================================="
     echo " Alienese OpenCode Demo is ALREADY RUNNING!"
     echo "=================================================================="
-    echo " Process ID:       $EXISTING_PID"
+    echo " OpenCode PID:     $EXISTING_PID"
     echo " Workspace:        $DEMO_DIR"
-    echo " Browser URL:      http://$HOST:$PORT/"
+    echo " OpenCode Web:     http://$HOST:$PORT/"
+    echo " Visual Dashboard: http://$HOST:$DASHBOARD_PORT/"
     echo " Model:            nebius/nvidia/nemotron-3-super-120b-a12b"
     echo "------------------------------------------------------------------"
     echo " To reset for a fresh recording take: $0 --reset"
@@ -182,6 +210,11 @@ unset EXTRACTED_KEY
 # Set Alienese runtime environment
 export ALIENESE_PYTHON="$VENV_PYTHON"
 export ALIENESE_READ_ONLY_TESTS="1"
+export ALIENESE_DEMO_MODE="1"
+export ALIENESE_EXPECTED_WORKSPACE="$DEMO_DIR"
+export XDG_DATA_HOME="$DEMO_DIR/.xdg/data"
+export XDG_CONFIG_HOME="$DEMO_DIR/.xdg/config"
+export XDG_STATE_HOME="$DEMO_DIR/.xdg/state"
 export PATH="$(dirname "$OPENCODE_BIN"):$REPO_ROOT/.venv/bin:$PATH"
 
 # Check or start three-model server if requested
@@ -195,6 +228,9 @@ if [ "$THREE_MODEL" -eq 1 ]; then
   export ALIENESE_THREE_MODEL="1"
   echo "Three-model architecture active: EmbeddingGemma 2 + mini-Jev + Nemotron 3 Super"
 fi
+
+# Start live visual dashboard on port 4097
+start_dashboard
 
 # Launch OpenCode Web
 cd "$DEMO_DIR"
@@ -233,23 +269,25 @@ fi
 echo "=================================================================="
 echo " Alienese — OpenCode Browser Demo is READY FOR RECORDING!"
 echo "=================================================================="
-echo " 1. Browser URL:        http://$HOST:$PORT/"
-echo " 2. Project Workspace:  $DEMO_DIR"
-echo " 3. Default Model:      nebius/nvidia/nemotron-3-super-120b-a12b"
-echo " 4. Provider:           Nebius Token Factory"
-echo " 5. Alienese Plugin:    plugins/opencode/alienese.js (ACTIVE)"
-echo " 6. Test Policy:        ALIENESE_READ_ONLY_TESTS=1 (ENFORCED)"
+echo " 1. OpenCode Browser:   http://$HOST:$PORT/"
+echo " 2. Live Dashboard:     http://$HOST:$DASHBOARD_PORT/"
+echo " 3. Project Workspace:  $DEMO_DIR"
+echo " 4. Default Model:      nebius/nvidia/nemotron-3-super-120b-a12b"
+echo " 5. Provider:           Nebius Token Factory"
+echo " 6. Alienese Plugin:    plugins/opencode/alienese.js (ACTIVE)"
+echo " 7. Test Policy:        ALIENESE_READ_ONLY_TESTS=1 (ENFORCED)"
 if [ "$THREE_MODEL" -eq 1 ]; then
-  echo " 7. Three-Model Engine: ACTIVE (EmbeddingGemma 2 + mini-Jev + Nemotron 3 Super)"
+  echo " 8. Three-Model Engine: ACTIVE (EmbeddingGemma 2 + mini-Jev + Nemotron 3 Super)"
 else
-  echo " 7. Mode:               STANDALONE NEMOTRON (Use --three-model for full 3-model demo)"
+  echo " 8. Mode:               STANDALONE NEMOTRON (Use --three-model for full 3-model demo)"
 fi
-echo " 8. Server PID:         $SERVER_PID"
+echo " 9. Server PID:         $SERVER_PID"
 echo "------------------------------------------------------------------"
 echo " READY-TO-PASTE PROMPT:"
 echo ' "Run pytest tests/test_session.py to observe the failure, investigate auth/session_manager.py, fix the session refresh bug, and verify tests pass."'
 echo "------------------------------------------------------------------"
 echo " MONITORING & LOGS:"
+echo " • Live Companion:      http://$HOST:$DASHBOARD_PORT/"
 echo " • Live Plugin Output:  tail -f $LOG_FILE"
 echo " • Live Audit Trace:    tail -f $DEMO_DIR/.alienese/opencode_trace.jsonl"
 echo "------------------------------------------------------------------"
