@@ -392,3 +392,77 @@ def test_dashboard_http_endpoints_session_filtering() -> None:
         finally:
             server.shutdown()
             server.server_close()
+
+
+def test_session_id_security_path_traversal_and_allowlist() -> None:
+    """Session IDs must be strictly allowlisted and path containment enforced."""
+    with tempfile.TemporaryDirectory() as tmp_str:
+        ws = Path(tmp_str).resolve()
+        tracker = OpenCodeSessionTracker(
+            workspace=ws, session_id="legit-session-1", three_model_mode=True
+        )
+        (ws / "service.py").write_text("def run(): pass\n", encoding="utf-8")
+        tracker.plan("Legit plan")
+
+        # 1. Path traversal target_session_id is rejected and falls back to allowlist
+        data_traversal = read_workspace_data(ws, target_session_id="../../etc/passwd")
+        assert data_traversal["session_id"] == "legit-session-1"
+
+        # 2. Arbitrary unregistered session ID is rejected and falls back
+        data_unregistered = read_workspace_data(ws, target_session_id="unregistered-sess-99")
+        assert data_unregistered["session_id"] == "legit-session-1"
+
+
+def test_dashboard_no_wildcard_cors() -> None:
+    """Dashboard API endpoints must NOT include wildcard Access-Control-Allow-Origin."""
+    import socket
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from alienese.dashboard.server import DashboardRequestHandler
+
+    with tempfile.TemporaryDirectory() as tmp_str:
+        ws = Path(tmp_str).resolve()
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        DashboardRequestHandler.workspace = ws
+        server = ThreadingHTTPServer(("127.0.0.1", port), DashboardRequestHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+
+        try:
+            for endpoint in ("/api/status", "/api/metrics", "/api/events", "/api/plan"):
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{endpoint}")
+                with urllib.request.urlopen(req) as resp:
+                    headers = dict(resp.headers)
+                    assert "Access-Control-Allow-Origin" not in headers, (
+                        f"Wildcard CORS header found on private localhost API: {endpoint}"
+                    )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_count_tokens_raises_runtime_error_on_tokenizer_failure() -> None:
+    """count_tokens must raise RuntimeError instead of silently substituting word counts."""
+    from alienese.opencode.tracker import count_tokens
+
+    with (
+        patch("tiktoken.get_encoding", side_effect=Exception("Simulated tokenizer error")),
+        pytest.raises(
+            RuntimeError, match="Tokenizer failure: tiktoken cl100k_base unavailable"
+        ),
+    ):
+        count_tokens("def foo(): pass")
+
+
+def test_nemotron_status_credentials_configured() -> None:
+    """Nemotron must report 'Credentials configured' when API key is present."""
+    with patch.dict(os.environ, {"NEBIUS_TOKEN_FACTORY_KEY": "test-key-factory"}, clear=False):
+        health = check_service_health()
+        assert health["generator"]["status"] == "Credentials configured"
+        assert "key present" in health["generator"]["detail"].lower()

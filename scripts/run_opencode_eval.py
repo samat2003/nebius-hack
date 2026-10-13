@@ -289,7 +289,7 @@ def setup_disposable_workspace(ws: Path) -> None:
         json.dumps(baseline_hashes, indent=2), encoding="utf-8"
     )
 
-    # OS-level read-only protection for test files and directories
+    # Policy-based protection and defense-in-depth permission fencing (does not claim sandbox)
     for p in tests_dir.rglob("*.py"):
         with contextlib.suppress(OSError):
             os.chmod(p, 0o444)

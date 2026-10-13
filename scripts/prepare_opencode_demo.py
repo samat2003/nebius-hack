@@ -111,7 +111,7 @@ def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
         json.dumps(baseline_hashes, indent=2), encoding="utf-8"
     )
 
-    # OS-level read-only protection for test files and directories
+    # Policy-based protection and defense-in-depth permission fencing (does not claim sandbox)
     for p in tests_dir.rglob("*.py"):
         with contextlib.suppress(OSError):
             os.chmod(p, 0o444)
@@ -225,7 +225,7 @@ def _validate_process_ownership(
 
     try:
         proc_cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
-        if proc_cwd != target_ws and target_ws not in proc_cwd.parents and proc_cwd != REPO_ROOT:
+        if proc_cwd != target_ws and target_ws not in proc_cwd.parents:
             return False
     except OSError:
         return False

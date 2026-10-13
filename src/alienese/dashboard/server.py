@@ -13,6 +13,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -66,8 +67,8 @@ def check_service_health(
                 except Exception:
                     pass
     if has_nebius:
-        gen_status = "Ready"
-        gen_detail = "API key configured"
+        gen_status = "Credentials configured"
+        gen_detail = "Nebius Token Factory key present"
 
     return {
         "retriever": {"status": retriever_status, "detail": retriever_detail},
@@ -95,15 +96,16 @@ def read_workspace_data(
         except Exception as e:
             logger.warning("Error reading trace file: %s", e)
 
-    # Discover all session IDs from session directory and trace records
+    # Discover all session IDs strictly matching valid identifier format
     discovered_sessions: dict[str, float] = {}
     if session_dir.is_dir():
         for p in session_dir.glob("*.json"):
             sid = p.stem
-            discovered_sessions[sid] = p.stat().st_mtime
+            if re.fullmatch(r"[a-zA-Z0-9_\-]+", sid):
+                discovered_sessions[sid] = p.stat().st_mtime
     for r in trace_records:
         r_sid = str(r.get("session_id") or "")
-        if r_sid and r_sid not in discovered_sessions:
+        if r_sid and re.fullmatch(r"[a-zA-Z0-9_\-]+", r_sid) and r_sid not in discovered_sessions:
             discovered_sessions[r_sid] = 0.0
 
     available_sessions = sorted(
@@ -112,24 +114,31 @@ def read_workspace_data(
         reverse=True,
     )
 
-    # Select active session ID
-    if target_session_id and (target_session_id in discovered_sessions or trace_records):
+    # Restrict active session ID strictly to discovered allowlist
+    if target_session_id and target_session_id in discovered_sessions:
         active_session_id = target_session_id
     elif available_sessions:
         active_session_id = available_sessions[0]
-    elif trace_records:
-        active_session_id = str(trace_records[-1].get("session_id") or "default")
     else:
         active_session_id = "default"
 
-    # Load session state for the active session
+    # Enforce resolved-path containment for session state file
     session_data: dict[str, Any] = {}
-    session_file = session_dir / f"{active_session_id}.json"
-    if session_file.is_file():
+    if active_session_id and active_session_id != "default":
+        safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", active_session_id)
+        candidate_file = (session_dir / f"{safe_id}.json").resolve()
+        contained = False
         try:
-            session_data = json.loads(session_file.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning("Error reading session file %s: %s", session_file, e)
+            candidate_file.relative_to(session_dir.resolve())
+            contained = True
+        except ValueError:
+            contained = False
+
+        if contained and candidate_file.is_file():
+            try:
+                session_data = json.loads(candidate_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning("Error reading session file %s: %s", candidate_file, e)
 
     # CRITICAL: Filter trace records strictly to the active session
     session_trace_records = [
@@ -287,6 +296,10 @@ def render_svg_bar(
 
 def generate_html_dashboard(data: dict[str, Any]) -> str:
     """Generate the complete modern dark UI HTML dashboard page."""
+    active_sid = str(data.get("session_id", ""))
+    active_sid_esc = html.escape(active_sid)
+    initial_sid_js = json.dumps(active_sid)
+
     # Metric A: Candidate Context Reduction
     cr = data.get("candidate_context_reduction")
     if cr and cr.get("reduction_pct") is not None:
@@ -341,7 +354,7 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     else:
         gemma_bars_html = (
             f'<div style="color: #64748B; font-style: italic; padding: 12px 0;">'
-            f'No retrieval rankings recorded for session {data["session_id"]}. '
+            f'No retrieval rankings recorded for session {active_sid_esc}. '
             f'Run alienese_plan.</div>'
         )
 
@@ -359,7 +372,7 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     else:
         jev_bars_html = (
             f'<div style="color: #64748B; font-style: italic; padding: 12px 0;">'
-            f'No controller choices recorded for session {data["session_id"]}.</div>'
+            f'No controller choices recorded for session {active_sid_esc}.</div>'
         )
 
     # Adherence display
@@ -442,15 +455,24 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     c_stat = models["controller"]["status"]
     c_col = "#10B981" if c_stat == "Ready" else "#EF4444"
     g_stat = models["generator"]["status"]
-    g_col = "#10B981" if g_stat == "Ready" else "#64748B"
+    g_col = (
+        "#38BDF8"
+        if "configured" in g_stat.lower()
+        else ("#10B981" if g_stat == "Ready" else "#64748B")
+    )
 
-    # Session switcher options HTML
+    r_stat_esc = html.escape(str(r_stat))
+    c_stat_esc = html.escape(str(c_stat))
+    g_stat_esc = html.escape(str(g_stat))
+
+    # Session switcher options HTML with strict escaping
     avail_sessions = data.get("available_sessions", [])
     ws_esc = html.escape(str(data.get("workspace", "")))
     session_options_html = ""
     for s in avail_sessions:
-        is_sel = "selected" if s == data["session_id"] else ""
-        session_options_html += f'<option value="{s}" {is_sel}>{s}</option>'
+        s_esc = html.escape(str(s))
+        is_sel = "selected" if s == active_sid else ""
+        session_options_html += f'<option value="{s_esc}" {is_sel}>{s_esc}</option>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -628,15 +650,15 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     <div class="model-pills">
       <div class="model-pill">
         <span>Retriever (EmbeddingGemma 2)</span>
-        <span style="color: {r_col}; font-weight: 600;">{r_stat}</span>
+        <span style="color: {r_col}; font-weight: 600;">{r_stat_esc}</span>
       </div>
       <div class="model-pill">
         <span>Controller (mini-Jev)</span>
-        <span style="color: {c_col}; font-weight: 600;">{c_stat}</span>
+        <span style="color: {c_col}; font-weight: 600;">{c_stat_esc}</span>
       </div>
       <div class="model-pill">
         <span>Generator (Nemotron 3 Super)</span>
-        <span style="color: {g_col}; font-weight: 600;">{g_stat}</span>
+        <span style="color: {g_col}; font-weight: 600;">{g_stat_esc}</span>
       </div>
     </div>
   </div>
@@ -793,7 +815,7 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
   <script>
     // Live stream via Server-Sent Events (SSE) respecting session_id
     const urlParams = new URLSearchParams(window.location.search);
-    const sid = urlParams.get('session_id') || "{data['session_id']}";
+    const sid = urlParams.get('session_id') || {initial_sid_js};
     const streamUrl = sid ? '/api/stream?session_id=' + encodeURIComponent(sid) : '/api/stream';
     const eventSource = new EventSource(streamUrl);
     eventSource.onmessage = function(event) {{
@@ -844,7 +866,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         elif parsed.path in ("/api/status", "/api/metrics", "/api/events", "/api/plan"):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
         else:
             self.send_response(HTTPStatus.OK)
@@ -869,7 +890,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(json_bytes)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json_bytes)
 
@@ -886,7 +906,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(json_bytes)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json_bytes)
 
@@ -901,7 +920,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(json_bytes)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json_bytes)
 
@@ -920,7 +938,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(json_bytes)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json_bytes)
 
@@ -929,7 +946,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
             try:

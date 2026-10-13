@@ -64,13 +64,56 @@ _PROTECTED_BASENAMES: frozenset[str] = frozenset(
 
 
 def count_tokens(text: str) -> int:
-    """Accurately count tokens using tiktoken (cl100k_base)."""
+    """Accurately count tokens using tiktoken (cl100k_base).
+
+    Raises RuntimeError if tiktoken is unavailable; never silently substitutes word counts.
+    """
     try:
         import tiktoken
+
         enc = tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(text, disallowed_special=()))
+    except Exception as exc:
+        raise RuntimeError(f"Tokenizer failure: tiktoken cl100k_base unavailable: {exc}") from exc
+
+
+def extract_opencode_token_usage(ws: Path, session_id: str) -> dict[str, int] | None:
+    """Extract authentic token usage recorded by OpenCode from its session database."""
+    db_file = ws / ".xdg" / "data" / "opencode" / "opencode.db"
+    if not db_file.is_file():
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("SELECT data FROM message WHERE session_id = ?", (session_id,))
+        rows = cur.fetchall()
+        conn.close()
+        total_input = 0
+        total_output = 0
+        found = False
+        for (raw,) in rows:
+            try:
+                d = json.loads(raw)
+                toks = d.get("tokens", {})
+                if toks and isinstance(toks, dict):
+                    inp = int(toks.get("input", 0))
+                    out = int(toks.get("output", 0))
+                    total_input += inp
+                    total_output += out
+                    found = True
+            except Exception:
+                continue
+        if found and (total_input > 0 or total_output > 0):
+            return {
+                "prompt_tokens": total_input,
+                "completion_tokens": total_output,
+                "total_tokens": total_input + total_output,
+            }
     except Exception:
-        return max(1, len(text.split()))
+        pass
+    return None
 
 
 class OpenCodeSessionTracker:
@@ -1219,16 +1262,27 @@ class OpenCodeSessionTracker:
             (1.0 - (selected_tokens / max(1, total_candidate_tokens))) * 100.0, 1
         )
         candidate_reduction_info = {
+            "metric": "Candidate Context Selection / Pruning (Representation)",
             "total_candidate_tokens": total_candidate_tokens,
             "selected_tokens": selected_tokens,
             "reduction_pct": reduction_pct,
             "formula": "1 - (selected_candidate_tokens / total_candidate_tokens)",
             "tokenizer": "tiktoken (cl100k_base)",
             "content_type": "Discovered candidate file representations (AST/Traceback/Repo)",
+            "note": (
+                "Measures candidate representation pruning. Does not represent "
+                "full Nemotron input prompt tokens."
+            ),
             "status": "measured",
         }
 
-        # Metric B: Actual Nemotron input-token savings (only when baseline exists)
+        # Connect real OpenCode/Nebius usage data if present
+        live_usage = extract_opencode_token_usage(self.workspace, self.session_id)
+        if live_usage:
+            self.token_usage = live_usage
+
+        # Metric B: Actual Nemotron input-token savings
+        # (only when baseline exists and real usage connected)
         actual_api_savings: dict[str, Any] | None = None
         baseline_metrics_path = self.workspace / ".alienese" / "baseline_metrics.json"
         if baseline_metrics_path.is_file():
@@ -1408,7 +1462,7 @@ class OpenCodeSessionTracker:
             "alienese_plan",
             {"goal": query_text},
             plan_details,
-            output_summary=plan_text[:500],
+            output_summary=plan_text,
         )
 
         return {
