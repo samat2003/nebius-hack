@@ -9,6 +9,7 @@ verification obligations, and records the session trace to results/opencode_sess
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -241,10 +242,26 @@ def load_env() -> dict[str, str]:
     return env
 
 
+def safe_rmtree(path: Path) -> None:
+    """Safely remove a directory tree, resetting read-only permissions first if needed."""
+    if not path.exists():
+        return
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(root, d), 0o755)
+        for f in files:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(root, f), 0o644)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o755)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def setup_disposable_workspace(ws: Path) -> None:
     """Create a pristine isolated workspace with buggy session manager."""
     if ws.exists():
-        shutil.rmtree(ws)
+        safe_rmtree(ws)
     ws.mkdir(parents=True, exist_ok=True)
 
     # Source modules
@@ -271,6 +288,13 @@ def setup_disposable_workspace(ws: Path) -> None:
     (trace_dir / "test_baseline_hashes.json").write_text(
         json.dumps(baseline_hashes, indent=2), encoding="utf-8"
     )
+
+    # OS-level read-only protection for test files and directories
+    for p in tests_dir.rglob("*.py"):
+        with contextlib.suppress(OSError):
+            os.chmod(p, 0o444)
+    with contextlib.suppress(OSError):
+        os.chmod(tests_dir, 0o555)
 
     # Isolated XDG directories
     (ws / ".xdg" / "data").mkdir(parents=True, exist_ok=True)

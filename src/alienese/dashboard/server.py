@@ -1,9 +1,9 @@
 """Alienese Live Visual Companion Dashboard Server.
 
 Serves an authentic real-time visual dashboard at http://127.0.0.1:4097
-displaying three-model orchestration, context reduction metrics, EmbeddingGemma
-dense rankings, mini-Jev decision policy scores, plan adherence, and RED -> GREEN
-verification obligations.
+displaying three-model orchestration, scientifically valid context reduction metrics,
+EmbeddingGemma dense rankings, mini-Jev decision policy scores, plan adherence,
+and RED -> GREEN verification obligations strictly scoped to active sessions.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import time
+import urllib.parse
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,8 +27,59 @@ DEFAULT_PORT = 4097
 DEFAULT_WORKSPACE = Path("/tmp/alienese_opencode_demo")
 
 
-def read_workspace_data(workspace: Path) -> dict[str, Any]:
-    """Parse real audit trace and session records from the workspace."""
+def check_service_health(
+    base_url: str = "http://127.0.0.1:8001",
+) -> dict[str, dict[str, str]]:
+    """Check live model server readiness and Nebius key configuration."""
+    retriever_status = "Unavailable"
+    controller_status = "Unavailable"
+    retriever_detail = "Offline"
+    controller_detail = "Offline"
+    try:
+        req = urllib.request.Request(f"{base_url}/health")
+        with urllib.request.urlopen(req, timeout=0.25) as resp:
+            if resp.status == 200:
+                hdata = json.loads(resp.read().decode("utf-8"))
+                if hdata.get("status") == "ok":
+                    r_info = hdata.get("retriever", {})
+                    c_info = hdata.get("controller", {})
+                    if r_info.get("status") == "ready":
+                        retriever_status = "Ready"
+                        retriever_detail = f"Online ({r_info.get('device', 'cpu')})"
+                    if c_info.get("status") == "ready":
+                        controller_status = "Ready"
+                        controller_detail = f"Online ({c_info.get('device', 'cpu')})"
+    except Exception:
+        pass
+
+    gen_status = "Unavailable"
+    gen_detail = "Not configured"
+    has_nebius = bool(os.getenv("NEBIUS_TOKEN_FACTORY_KEY") or os.getenv("NEBIUS_API_KEY"))
+    if not has_nebius:
+        for env_path in [Path(".env"), Path(__file__).resolve().parents[3] / ".env"]:
+            if env_path.is_file():
+                try:
+                    txt = env_path.read_text(encoding="utf-8")
+                    if "NEBIUS_TOKEN_FACTORY_KEY" in txt or "NEBIUS_API_KEY" in txt:
+                        has_nebius = True
+                        break
+                except Exception:
+                    pass
+    if has_nebius:
+        gen_status = "Ready"
+        gen_detail = "API key configured"
+
+    return {
+        "retriever": {"status": retriever_status, "detail": retriever_detail},
+        "controller": {"status": controller_status, "detail": controller_detail},
+        "generator": {"status": gen_status, "detail": gen_detail},
+    }
+
+
+def read_workspace_data(
+    workspace: Path, target_session_id: str | None = None
+) -> dict[str, Any]:
+    """Parse real audit trace and session records for an explicitly selected session."""
     ws = workspace.resolve()
     trace_file = ws / ".alienese" / "opencode_trace.jsonl"
     session_dir = ws / ".alienese" / "sessions"
@@ -42,67 +95,92 @@ def read_workspace_data(workspace: Path) -> dict[str, Any]:
         except Exception as e:
             logger.warning("Error reading trace file: %s", e)
 
-    # Find latest session state
-    session_data: dict[str, Any] = {}
+    # Discover all session IDs from session directory and trace records
+    discovered_sessions: dict[str, float] = {}
     if session_dir.is_dir():
-        session_files = sorted(session_dir.glob("*.json"), key=os.path.getmtime, reverse=True)
-        if session_files:
-            try:
-                session_data = json.loads(session_files[0].read_text(encoding="utf-8"))
-            except Exception as e:
-                logger.warning("Error reading session file: %s", e)
+        for p in session_dir.glob("*.json"):
+            sid = p.stem
+            discovered_sessions[sid] = p.stat().st_mtime
+    for r in trace_records:
+        r_sid = str(r.get("session_id") or "")
+        if r_sid and r_sid not in discovered_sessions:
+            discovered_sessions[r_sid] = 0.0
 
-    # Extract latest plan
+    available_sessions = sorted(
+        discovered_sessions.keys(),
+        key=lambda s: discovered_sessions.get(s, 0.0),
+        reverse=True,
+    )
+
+    # Select active session ID
+    if target_session_id and (target_session_id in discovered_sessions or trace_records):
+        active_session_id = target_session_id
+    elif available_sessions:
+        active_session_id = available_sessions[0]
+    elif trace_records:
+        active_session_id = str(trace_records[-1].get("session_id") or "default")
+    else:
+        active_session_id = "default"
+
+    # Load session state for the active session
+    session_data: dict[str, Any] = {}
+    session_file = session_dir / f"{active_session_id}.json"
+    if session_file.is_file():
+        try:
+            session_data = json.loads(session_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Error reading session file %s: %s", session_file, e)
+
+    # CRITICAL: Filter trace records strictly to the active session
+    session_trace_records = [
+        r for r in trace_records if r.get("session_id") == active_session_id
+    ]
+
+    # Extract latest plan strictly from this session's trace
     plan_entry = next(
-        (r for r in reversed(trace_records) if r.get("phase") == "ALIENESE_PLAN"), None
+        (r for r in reversed(session_trace_records) if r.get("phase") == "ALIENESE_PLAN"),
+        None,
     )
     plan_details = plan_entry.get("details", {}) if plan_entry else {}
 
-    # Extract context reduction metrics
-    context_reduction = plan_details.get("context_reduction", {})
-    if not context_reduction:
-        # Compute baseline if not directly recorded
-        total_tokens = 6200
-        selected_tokens = 950
-        reduction_pct = round((1.0 - (selected_tokens / total_tokens)) * 100.0, 1)
-        context_reduction = {
-            "total_candidate_tokens": total_tokens,
-            "selected_tokens": selected_tokens,
-            "reduction_pct": reduction_pct,
-            "formula": "1 - (selected_tokens / total_candidate_tokens)",
-        }
+    # Context reduction metrics: candidate context reduction (Metric A)
+    # NO FABRICATED NUMBERS! If not measured, candidate_context_reduction is None.
+    candidate_reduction = (
+        plan_details.get("candidate_context_reduction")
+        or plan_details.get("context_reduction")
+    )
+    # Actual API token savings (Metric B)
+    actual_api_savings = plan_details.get("actual_api_savings")
 
-    # Extract EmbeddingGemma rankings
+    # Extract EmbeddingGemma rankings strictly from this session's plan
     ranked_files = plan_details.get("ranked_files", [])
 
-    # Extract mini-Jev options and scores
+    # Extract mini-Jev options and scores strictly from this session's plan
     jev_options = plan_details.get("options", [])
     selected_id = plan_details.get("selected_id")
     selected_label = plan_details.get("selected_label")
     selected_prob = plan_details.get("selected_probability", 0.0)
 
-    # Extract Plan Adherence
-    adherence = None
-    for r in reversed(trace_records):
-        if r.get("phase") in ("PRE_TOOL", "POST_TOOL") and r.get("tool") != "alienese_plan":
+    # Extract plan adherence strictly from this session
+    adherence = session_data.get("plan_adherence") or session_data.get("last_adherence")
+    if not adherence:
+        for r in session_trace_records:
             adh = r.get("adherence") or (r.get("details") or {}).get("adherence")
             if adh:
                 adherence = adh
                 break
-    if not adherence and session_data.get("last_adherence"):
-        adherence = session_data.get("last_adherence")
 
-    # Extract mutations and verification state
+    # Extract mutations strictly from this session
     mutations: list[str] = list(session_data.get("mutations", []))
-    verification_obligation = bool(session_data.get("verification_obligation", False))
-    last_test_passed = session_data.get("last_test_passed")
-
-    for r in trace_records:
+    for r in session_trace_records:
         for m in r.get("mutations", []):
             if m not in mutations:
                 mutations.append(m)
 
-    # Derive verification lifecycle status
+    verification_obligation = bool(session_data.get("verification_obligation", False))
+    last_test_passed = session_data.get("last_test_passed")
+
+    # Derive verification lifecycle status strictly for this session
     if last_test_passed is True and len(mutations) > 0 and not verification_obligation:
         verification_status = "GREEN_VERIFIED"
         verification_status_label = "VERIFIED (GREEN)"
@@ -120,37 +198,41 @@ def read_workspace_data(workspace: Path) -> dict[str, Any]:
         verification_status_label = "STANDBY"
         verification_status_color = "#64748B"
 
-    # Compute tokens per model estimate
-    gemma_tokens = 768 * max(1, len(ranked_files) + 1)
-    jev_tokens = 250 * max(1, len(jev_options))
-    nemotron_tokens = 2800 if len(mutations) > 0 else 600
+    # Query live service health
+    svc_health = check_service_health()
 
     return {
         "workspace": str(ws),
-        "session_id": session_data.get("session_id", "default"),
-        "step_count": session_data.get("sequence_no", len(trace_records)),
+        "session_id": active_session_id,
+        "available_sessions": available_sessions,
+        "step_count": session_data.get("sequence_no", len(session_trace_records)),
         "state_digest": session_data.get("state_digest", "0" * 64)[:16],
         "state_digest_full": session_data.get("state_digest", "0" * 64),
         "models": {
             "retriever": {
                 "name": "EmbeddingGemma 2",
                 "role": "Dense Matryoshka Context Ranking (768d)",
-                "status": "Ready",
+                "status": svc_health["retriever"]["status"],
+                "detail": svc_health["retriever"]["detail"],
             },
             "controller": {
                 "name": "mini-Jev",
                 "revision": "step-010626",
                 "role": "Bounded Next-Action Policy Head (Qwen3-0.6B)",
-                "status": "Ready",
+                "status": svc_health["controller"]["status"],
+                "detail": svc_health["controller"]["detail"],
             },
             "generator": {
                 "name": "NVIDIA Nemotron 3 Super (120B-A12B)",
                 "provider": "Nebius Token Factory",
                 "role": "Reasoning & Targeted Code Synthesis",
-                "status": "Ready",
+                "status": svc_health["generator"]["status"],
+                "detail": svc_health["generator"]["detail"],
             },
         },
-        "context_reduction": context_reduction,
+        "candidate_context_reduction": candidate_reduction,
+        "context_reduction": candidate_reduction,
+        "actual_api_savings": actual_api_savings,
         "ranked_files": ranked_files,
         "jev_options": jev_options,
         "selected_id": selected_id,
@@ -163,13 +245,9 @@ def read_workspace_data(workspace: Path) -> dict[str, Any]:
         "verification_status": verification_status,
         "verification_status_label": verification_status_label,
         "verification_status_color": verification_status_color,
-        "tokens_per_model": {
-            "EmbeddingGemma 2": gemma_tokens,
-            "mini-Jev": jev_tokens,
-            "Nemotron 3 Super": nemotron_tokens,
-        },
-        "trace_events": trace_records[-20:],
-        "trace_total_count": len(trace_records),
+        "tokens_per_model": None,
+        "trace_events": session_trace_records[-20:],
+        "trace_total_count": len(session_trace_records),
     }
 
 
@@ -183,16 +261,16 @@ def render_svg_bar(
     badge = ' <tspan fill="#10B981" font-weight="bold">★ SELECTED</tspan>' if is_highlighted else ""
 
     bar_head = (
-        'display: flex; justify-content: space-between; font-size: 13px; '
-        'font-family: monospace; color: #E2E8F0; margin-bottom: 4px;'
+        "display: flex; justify-content: space-between; font-size: 13px; "
+        "font-family: monospace; color: #E2E8F0; margin-bottom: 4px;"
     )
     bar_track = (
-        'background: rgba(255,255,255,0.06); border-radius: 4px; '
-        'height: 10px; overflow: hidden; position: relative;'
+        "background: rgba(255,255,255,0.06); border-radius: 4px; "
+        "height: 10px; overflow: hidden; position: relative;"
     )
     bar_fill = (
-        f'background: {fill_color}; width: {pct}%; height: 100%; '
-        f'border-radius: 4px; transition: width 0.4s ease; {highlight_style}'
+        f"background: {fill_color}; width: {pct}%; height: 100%; "
+        f"border-radius: 4px; transition: width 0.4s ease; {highlight_style}"
     )
     return f"""
     <div style="margin-bottom: 8px;">
@@ -209,11 +287,48 @@ def render_svg_bar(
 
 def generate_html_dashboard(data: dict[str, Any]) -> str:
     """Generate the complete modern dark UI HTML dashboard page."""
-    cr = data["context_reduction"]
-    reduction_pct = cr.get("reduction_pct", 0.0)
-    selected_tokens = cr.get("selected_tokens", 0)
-    total_candidate_tokens = cr.get("total_candidate_tokens", 0)
-    sel_prob_pct = f"{data.get('selected_probability', 0.0):.1%}"
+    # Metric A: Candidate Context Reduction
+    cr = data.get("candidate_context_reduction")
+    if cr and cr.get("reduction_pct") is not None:
+        reduction_pct_str = f"{cr['reduction_pct']}%"
+        sel_tok = cr.get("selected_tokens", 0)
+        tot_tok = cr.get("total_candidate_tokens", 0)
+        tok_method = cr.get("tokenizer", "tiktoken (cl100k_base)")
+        cr_sub = f"{sel_tok:,} selected / {tot_tok:,} candidate tokens"
+        cr_detail = f"Tokenizer: {tok_method}"
+        cr_color = "#38BDF8"
+    else:
+        reduction_pct_str = "Not measured"
+        cr_sub = "Awaiting alienese_plan execution"
+        cr_detail = "Formula: 1 - (selected / candidate)"
+        cr_color = "#64748B"
+
+    # Metric B: Actual LLM API Token Savings
+    api_sav = data.get("actual_api_savings")
+    if api_sav and api_sav.get("savings_pct") is not None:
+        api_sav_val = f"{api_sav['savings_pct']}%"
+        a_tok = api_sav.get("alienese_tokens", 0)
+        b_tok = api_sav.get("baseline_tokens", 0)
+        api_sav_sub = f"{a_tok:,} tokens vs {b_tok:,} baseline"
+        api_sav_src = str(api_sav.get("source", "Nebius API"))
+        api_sav_color = "#10B981"
+    else:
+        api_sav_val = "Not measured"
+        api_sav_sub = "Requires baseline benchmark run"
+        api_sav_src = "No synthetic estimate"
+        api_sav_color = "#64748B"
+
+    # mini-Jev Decision Card
+    if data.get("selected_id"):
+        jev_title = html.escape(str(data.get("selected_label") or "Standing By"))
+        jev_score = f"{data.get('selected_probability', 0.0):.1%}"
+        jev_id = html.escape(str(data.get("selected_id")))
+        jev_color = "#A855F7"
+    else:
+        jev_title = "Standing By"
+        jev_score = "Not measured"
+        jev_id = "none"
+        jev_color = "#64748B"
 
     # EmbeddingGemma Ranking bars
     gemma_bars_html = ""
@@ -225,8 +340,9 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
             gemma_bars_html += render_svg_bar(fpath, score, max_score, fill, idx == 0)
     else:
         gemma_bars_html = (
-            '<div style="color: #64748B; font-style: italic; padding: 12px 0;">'
-            'No retrieval rankings recorded yet. Run alienese_plan.</div>'
+            f'<div style="color: #64748B; font-style: italic; padding: 12px 0;">'
+            f'No retrieval rankings recorded for session {data["session_id"]}. '
+            f'Run alienese_plan.</div>'
         )
 
     # mini-Jev Options bars
@@ -242,8 +358,8 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
             jev_bars_html += render_svg_bar(lbl, prob, 1.0, fill, is_sel)
     else:
         jev_bars_html = (
-            '<div style="color: #64748B; font-style: italic; padding: 12px 0;">'
-            'No controller choices recorded yet.</div>'
+            f'<div style="color: #64748B; font-style: italic; padding: 12px 0;">'
+            f'No controller choices recorded for session {data["session_id"]}.</div>'
         )
 
     # Adherence display
@@ -265,7 +381,7 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
           <div style="color: #94A3B8;">Recommended:
             <span style="color: #E2E8F0;">{rec_str}</span>
           </div>
-          <div style="color: #94A3B8; margin-top: 4px;">Actual:
+          <div style="color: #94A3B8; margin-top: 4px;">1st Action:
             <span style="color: #38BDF8;">{act_str}</span>
           </div>
         </div>
@@ -313,10 +429,28 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     step5_done = v_status == "GREEN_VERIFIED"
 
     def stage_circle(done: bool, active: bool, color: str) -> str:
-        bg = color if done else ("#1E293B")
-        border = color if (done or active) else "#334155"
+        r_c, g_c, b_c = color[1:3], color[3:5], color[5:7]
+        bg = f"rgba({r_c},{g_c},{b_c},0.2)" if done else "rgba(255,255,255,0.05)"
+        border = color if done else "rgba(255,255,255,0.15)"
         txt_color = "#FFFFFF" if done else "#64748B"
         return f"background: {bg}; border: 2px solid {border}; color: {txt_color};"
+
+    # Model readiness badges and colors
+    models = data["models"]
+    r_stat = models["retriever"]["status"]
+    r_col = "#10B981" if r_stat == "Ready" else "#EF4444"
+    c_stat = models["controller"]["status"]
+    c_col = "#10B981" if c_stat == "Ready" else "#EF4444"
+    g_stat = models["generator"]["status"]
+    g_col = "#10B981" if g_stat == "Ready" else "#64748B"
+
+    # Session switcher options HTML
+    avail_sessions = data.get("available_sessions", [])
+    ws_esc = html.escape(str(data.get("workspace", "")))
+    session_options_html = ""
+    for s in avail_sessions:
+        is_sel = "selected" if s == data["session_id"] else ""
+        session_options_html += f'<option value="{s}" {is_sel}>{s}</option>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -345,7 +479,6 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
       font-size: 24px;
       font-weight: 700;
       letter-spacing: -0.5px;
-      color: #FFFFFF;
       display: flex;
       align-items: center;
       gap: 10px;
@@ -355,8 +488,7 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
       height: 10px;
       background: #10B981;
       border-radius: 50%;
-      box-shadow: 0 0 10px #10B981;
-      display: inline-block;
+      box-shadow: 0 0 12px #10B981;
     }}
     .subtitle {{
       color: #94A3B8;
@@ -365,46 +497,46 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     }}
     .model-pills {{
       display: flex;
-      gap: 8px;
+      gap: 12px;
     }}
     .model-pill {{
       background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      padding: 6px 12px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 8px 14px;
       border-radius: 8px;
       font-size: 12px;
       display: flex;
       flex-direction: column;
+      gap: 2px;
     }}
-    .model-pill span:first-child {{
-      font-size: 10px;
-      color: #94A3B8;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }}
-    .model-pill span:last-child {{
-      font-weight: 600;
-      color: #38BDF8;
-    }}
-    .grid-4 {{
+    .grid-5 {{
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 16px;
       margin-bottom: 24px;
     }}
+    @media (max-width: 1200px) {{
+      .grid-5 {{ grid-template-columns: repeat(2, 1fr); }}
+    }}
+    .grid-2 {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }}
     .card {{
-      background: #111827;
-      border: 1px solid rgba(255, 255, 255, 0.07);
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 12px;
-      padding: 18px;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      padding: 20px;
     }}
     .card-title {{
       font-size: 12px;
+      font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
       color: #94A3B8;
-      margin-bottom: 8px;
+      margin-bottom: 12px;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -412,60 +544,53 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     .card-big {{
       font-size: 28px;
       font-weight: 700;
-      color: #F8FAFC;
+      letter-spacing: -1px;
+      margin-bottom: 6px;
     }}
     .card-sub {{
       font-size: 12px;
-      color: #64748B;
-      margin-top: 6px;
-      font-family: monospace;
-    }}
-    .grid-2 {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-bottom: 24px;
+      color: #94A3B8;
     }}
     .timeline {{
       display: flex;
       justify-content: space-between;
+      align-items: center;
       position: relative;
-      margin: 20px 0 10px 0;
+      margin: 16px 0 8px 0;
     }}
     .timeline::before {{
       content: "";
       position: absolute;
-      top: 14px;
-      left: 20px;
-      right: 20px;
+      top: 18px;
+      left: 30px;
+      right: 30px;
       height: 2px;
       background: rgba(255, 255, 255, 0.1);
       z-index: 1;
     }}
     .timeline-step {{
-      position: relative;
-      z-index: 2;
       display: flex;
       flex-direction: column;
       align-items: center;
-      text-align: center;
-      width: 18%;
+      position: relative;
+      z-index: 2;
     }}
     .timeline-node {{
-      width: 28px;
-      height: 28px;
+      width: 36px;
+      height: 36px;
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 12px;
       font-weight: 700;
+      font-size: 14px;
       margin-bottom: 8px;
     }}
     .timeline-label {{
       font-size: 11px;
       color: #94A3B8;
-      font-weight: 500;
+      text-align: center;
+      max-width: 110px;
     }}
     table {{
       width: 100%;
@@ -488,52 +613,75 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
     <div class="title-group">
       <h1><span class="pulse-dot"></span> Alienese Live Orchestration Engine</h1>
       <div class="subtitle">Multi-Model Gateway & Deterministic Policy Runtime • Port 4097</div>
+      <div style="font-size: 12px; color: #94A3B8; margin-top: 6px; display: flex; gap: 8px;">
+        <span>Active Session:</span>
+        <select onchange="window.location.search = '?session_id=' + this.value"
+          style="background: #1E293B; color: #38BDF8; border: 1px solid #475569; padding: 2px 6px;">
+          {session_options_html}
+        </select>
+        <span>• Workspace:
+          <span style="color: #E2E8F0; font-family: monospace;">{ws_esc}</span>
+        </span>
+        <span>• Events: <span style="color: #F8FAFC;">{data["trace_total_count"]}</span></span>
+      </div>
     </div>
     <div class="model-pills">
       <div class="model-pill">
-        <span>Retriever</span>
-        <span style="color: #38BDF8;">EmbeddingGemma 2 (768d)</span>
+        <span>Retriever (EmbeddingGemma 2)</span>
+        <span style="color: {r_col}; font-weight: 600;">{r_stat}</span>
       </div>
       <div class="model-pill">
-        <span>Controller</span>
-        <span style="color: #A855F7;">mini-Jev @ step-010626</span>
+        <span>Controller (mini-Jev)</span>
+        <span style="color: {c_col}; font-weight: 600;">{c_stat}</span>
       </div>
       <div class="model-pill">
-        <span>Generator</span>
-        <span style="color: #10B981;">Nemotron 3 Super (Nebius)</span>
+        <span>Generator (Nemotron 3 Super)</span>
+        <span style="color: {g_col}; font-weight: 600;">{g_stat}</span>
       </div>
     </div>
   </div>
 
   <!-- Key Metrics Row -->
-  <div class="grid-4">
-    <!-- Context Reduction Card -->
+  <div class="grid-5">
+    <!-- Candidate Context Pruning Card (Metric A) -->
     <div class="card">
       <div class="card-title">
-        <span>Context Reduction</span>
-        <span style="color: #38BDF8;">EmbeddingGemma 2</span>
+        <span>Candidate Pruning</span>
+        <span style="color: {cr_color}; font-size: 11px;">METRIC A</span>
       </div>
-      <div class="card-big" style="color: #38BDF8;">{reduction_pct}%</div>
-      <div class="card-sub">{selected_tokens:,} sel / {total_candidate_tokens:,} cand tokens</div>
-      <div class="card-sub" style="font-size: 11px; color: #64748B;">
-        Formula: 1 - (selected / candidate)
+      <div class="card-big" style="color: {cr_color}; font-size: 24px;">{reduction_pct_str}</div>
+      <div class="card-sub">{cr_sub}</div>
+      <div class="card-sub" style="font-size: 11px; color: #64748B; margin-top: 2px;">
+        {cr_detail}
+      </div>
+    </div>
+
+    <!-- Actual LLM API Token Savings Card (Metric B) -->
+    <div class="card">
+      <div class="card-title">
+        <span>API Token Savings</span>
+        <span style="color: {api_sav_color}; font-size: 11px;">METRIC B</span>
+      </div>
+      <div class="card-big" style="color: {api_sav_color}; font-size: 24px;">{api_sav_val}</div>
+      <div class="card-sub">{api_sav_sub}</div>
+      <div class="card-sub" style="font-size: 11px; color: #64748B; margin-top: 2px;">
+        Source: {api_sav_src}
       </div>
     </div>
 
     <!-- mini-Jev Decision Card -->
     <div class="card">
       <div class="card-title">
-        <span>mini-Jev Policy Choice</span>
-        <span style="color: #A855F7;">Decision Head</span>
+        <span>mini-Jev Choice</span>
+        <span style="color: #A855F7;">Set-Head</span>
       </div>
-      <div class="card-big" style="font-size: 19px; color: #A855F7;">
-        {html.escape(str(data.get("selected_label") or "Standing By"))}
+      <div class="card-big" style="font-size: 17px; color: {jev_color};">
+        {jev_title}
       </div>
       <div class="card-sub">
-        Softmax:
-        <span style="color: #10B981; font-weight: 600;">{sel_prob_pct}</span>
+        Softmax: <span style="color: #10B981; font-weight: 600;">{jev_score}</span>
       </div>
-      <div class="card-sub">Choice ID: {html.escape(str(data.get("selected_id") or "none"))}</div>
+      <div class="card-sub">ID: {jev_id}</div>
     </div>
 
     <!-- Plan Adherence Card -->
@@ -553,13 +701,13 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
           {data["verification_status_label"]}
         </span>
       </div>
-      <div class="card-big" style="font-size: 18px; color: {data["verification_status_color"]};">
+      <div class="card-big" style="font-size: 17px; color: {data["verification_status_color"]};">
         {f"MUTATIONS: {len(data['mutations'])}" if data.get("mutations") else "CLEAN WORKTREE"}
       </div>
       <div class="card-sub">
-        State Digest: <span style="color: #94A3B8;">{data["state_digest"]}…</span>
+        Digest: <span style="color: #94A3B8;">{data["state_digest"]}…</span>
       </div>
-      <div class="card-sub">Step Count: {data["step_count"]} events</div>
+      <div class="card-sub">Events: {data["step_count"]}</div>
     </div>
   </div>
 
@@ -622,7 +770,7 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
   <div class="card">
     <div class="card-title">
       <span>Live Audit Trace Feed (.alienese/opencode_trace.jsonl)</span>
-      <span style="color: #10B981;">{data["trace_total_count"]} Total Recorded Invariants</span>
+      <span style="color: #10B981;">{data["trace_total_count"]} Total Events</span>
     </div>
     <div style="overflow-x: auto; margin-top: 10px;">
       <table>
@@ -643,13 +791,15 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
   </div>
 
   <script>
-    // Live stream via Server-Sent Events (SSE)
-    const eventSource = new EventSource('/api/stream');
+    // Live stream via Server-Sent Events (SSE) respecting session_id
+    const urlParams = new URLSearchParams(window.location.search);
+    const sid = urlParams.get('session_id') || "{data['session_id']}";
+    const streamUrl = sid ? '/api/stream?session_id=' + encodeURIComponent(sid) : '/api/stream';
+    const eventSource = new EventSource(streamUrl);
     eventSource.onmessage = function(event) {{
       try {{
         const payload = JSON.parse(event.data);
         if (payload && payload.timestamp) {{
-          // Reload page content on new event if step changed
           if (window.__last_step !== undefined && window.__last_step !== payload.step_count) {{
             window.location.reload();
           }}
@@ -658,7 +808,6 @@ def generate_html_dashboard(data: dict[str, Any]) -> str:
       }} catch(e) {{}}
     }};
     eventSource.onerror = function() {{
-      // Fallback reload every 3 seconds if SSE disconnects
       setTimeout(() => window.location.reload(), 3000);
     }};
   </script>
@@ -676,28 +825,37 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         """Suppress standard access logs to avoid terminal clutter."""
         pass
 
+    def _get_target_session_id(self) -> str | None:
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        sids = params.get("session_id")
+        return sids[0] if sids else None
+
     def do_HEAD(self) -> None:
-        if self.path in ("/", "/index.html"):
-            data = read_workspace_data(self.workspace)
+        parsed = urllib.parse.urlparse(self.path)
+        session_id = self._get_target_session_id()
+        if parsed.path in ("/", "/index.html"):
+            data = read_workspace_data(self.workspace, target_session_id=session_id)
             html_content = generate_html_dashboard(data).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html_content)))
             self.end_headers()
-        elif self.path == "/api/status":
-            data = read_workspace_data(self.workspace)
-            json_bytes = json.dumps(data, indent=2).encode("utf-8")
+        elif parsed.path in ("/api/status", "/api/metrics", "/api/events", "/api/plan"):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(json_bytes)))
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
         else:
             self.send_response(HTTPStatus.OK)
             self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path == "/" or self.path == "/index.html":
-            data = read_workspace_data(self.workspace)
+        parsed = urllib.parse.urlparse(self.path)
+        session_id = self._get_target_session_id()
+
+        if parsed.path in ("/", "/index.html"):
+            data = read_workspace_data(self.workspace, target_session_id=session_id)
             html_content = generate_html_dashboard(data).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -705,8 +863,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html_content)
 
-        elif self.path == "/api/status":
-            data = read_workspace_data(self.workspace)
+        elif parsed.path == "/api/status":
+            data = read_workspace_data(self.workspace, target_session_id=session_id)
             json_bytes = json.dumps(data, indent=2).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -715,7 +873,58 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json_bytes)
 
-        elif self.path == "/api/stream":
+        elif parsed.path == "/api/metrics":
+            data = read_workspace_data(self.workspace, target_session_id=session_id)
+            metrics_payload = {
+                "session_id": data.get("session_id"),
+                "candidate_context_reduction": data.get("candidate_context_reduction"),
+                "actual_api_savings": data.get("actual_api_savings"),
+                "tokens_per_model": data.get("tokens_per_model"),
+                "models": data.get("models"),
+            }
+            json_bytes = json.dumps(metrics_payload, indent=2).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(json_bytes)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json_bytes)
+
+        elif parsed.path == "/api/events":
+            data = read_workspace_data(self.workspace, target_session_id=session_id)
+            events_payload = {
+                "session_id": data.get("session_id"),
+                "events": data.get("trace_events", []),
+                "total_count": data.get("trace_total_count", 0),
+            }
+            json_bytes = json.dumps(events_payload, indent=2).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(json_bytes)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json_bytes)
+
+        elif parsed.path == "/api/plan":
+            data = read_workspace_data(self.workspace, target_session_id=session_id)
+            plan_payload = {
+                "session_id": data.get("session_id"),
+                "ranked_files": data.get("ranked_files", []),
+                "jev_options": data.get("jev_options", []),
+                "selected_id": data.get("selected_id"),
+                "selected_label": data.get("selected_label"),
+                "selected_probability": data.get("selected_probability"),
+                "adherence": data.get("adherence"),
+            }
+            json_bytes = json.dumps(plan_payload, indent=2).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(json_bytes)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json_bytes)
+
+        elif parsed.path == "/api/stream":
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -725,11 +934,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
             try:
                 for _ in range(3600):  # Stream up to 1 hour
-                    data = read_workspace_data(self.workspace)
+                    data = read_workspace_data(self.workspace, target_session_id=session_id)
                     curr_step = data.get("step_count", 0)
                     msg_payload = json.dumps(
                         {
                             "timestamp": time.time(),
+                            "session_id": data.get("session_id"),
                             "step_count": curr_step,
                             "verification_status": data.get("verification_status"),
                             "mutations_count": len(data.get("mutations", [])),
@@ -745,29 +955,33 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def run_dashboard_server(port: int = DEFAULT_PORT, workspace: Path = DEFAULT_WORKSPACE) -> None:
-    """Run the dashboard server."""
+def run_dashboard_server(
+    port: int = DEFAULT_PORT,
+    workspace: Path = DEFAULT_WORKSPACE,
+) -> None:
+    """Run dashboard HTTP/SSE companion server."""
     DashboardRequestHandler.workspace = workspace
-    server = ThreadingHTTPServer(("127.0.0.1", port), DashboardRequestHandler)
-    print(f"Alienese Dashboard listening on http://127.0.0.1:{port}/")
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardRequestHandler)
+    print(f"[Alienese Visual Dashboard] Serving at http://127.0.0.1:{port}/")
+    print(f"[Alienese Visual Dashboard] Monitoring workspace: {workspace}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\n[Alienese Visual Dashboard] Shutting down...")
     finally:
         server.server_close()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Alienese Live Companion Dashboard Server")
+    parser = argparse.ArgumentParser(description="Alienese Visual Companion Dashboard")
     parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help="Port to listen on (default: 4097)"
+        "--port", type=int, default=DEFAULT_PORT, help="Port to bind (default: 4097)"
     )
     parser.add_argument(
         "--workspace",
         type=Path,
         default=DEFAULT_WORKSPACE,
-        help="Workspace directory to monitor (default: /tmp/alienese_opencode_demo)",
+        help="Target workspace to monitor (default: /tmp/alienese_opencode_demo)",
     )
     args = parser.parse_args()
     run_dashboard_server(port=args.port, workspace=args.workspace)

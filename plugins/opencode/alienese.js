@@ -27,7 +27,18 @@ const PYTHON_PATH_DIR = path.join(REPO_ROOT, "src");
 const PROTECTED_TOOLS = new Set([
   "read",
   "read_file",
+  "view",
   "view_file",
+  "open",
+  "glob",
+  "grep",
+  "search",
+  "file_search",
+  "find",
+  "find_by_name",
+  "list_dir",
+  "list_directory",
+  "ls",
   "write",
   "write_file",
   "write_to_file",
@@ -35,9 +46,11 @@ const PROTECTED_TOOLS = new Set([
   "edit_file",
   "replace_file_content",
   "patch",
+  "apply_patch",
   "bash",
   "run_command",
   "command",
+  "execute_command",
 ]);
 
 function getPythonCmd(workspaceDir) {

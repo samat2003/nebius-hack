@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
@@ -49,6 +48,22 @@ def load_nebius_key() -> str:
     return ""
 
 
+def safe_rmtree(path: Path) -> None:
+    """Safely remove a directory tree, resetting read-only permissions first if needed."""
+    if not path.exists():
+        return
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(root, d), 0o755)
+        for f in files:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(root, f), 0o644)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o755)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def compute_test_hashes(tests_dir: Path) -> dict[str, str]:
     """Compute deterministic SHA-256 baseline hashes for test files."""
     hashes: dict[str, str] = {}
@@ -62,7 +77,7 @@ def compute_test_hashes(tests_dir: Path) -> dict[str, str]:
 def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
     """Setup isolated disposable challenge in /tmp/alienese_opencode_demo."""
     if reset and ws.exists():
-        shutil.rmtree(ws)
+        safe_rmtree(ws)
 
     ws.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init"], cwd=ws, capture_output=True)
@@ -89,12 +104,19 @@ def setup_demo_workspace(ws: Path, reset: bool = False) -> None:
     # Clear previous trace and compute baseline test hashes
     trace_dir = ws / ".alienese"
     if trace_dir.exists():
-        shutil.rmtree(trace_dir)
+        safe_rmtree(trace_dir)
     trace_dir.mkdir(parents=True, exist_ok=True)
     baseline_hashes = compute_test_hashes(tests_dir)
     (trace_dir / "test_baseline_hashes.json").write_text(
         json.dumps(baseline_hashes, indent=2), encoding="utf-8"
     )
+
+    # OS-level read-only protection for test files and directories
+    for p in tests_dir.rglob("*.py"):
+        with contextlib.suppress(OSError):
+            os.chmod(p, 0o444)
+    with contextlib.suppress(OSError):
+        os.chmod(tests_dir, 0o555)
 
     # Configure OpenCode with Nemotron default model and Alienese plugin
     plugin_js = REPO_ROOT / "plugins" / "opencode" / "alienese.js"
@@ -192,6 +214,34 @@ def check_demo_status(ws: Path) -> dict[str, Any]:
     }
 
 
+def _validate_process_ownership(
+    pid: int, target_ws: Path, expected_pattern: str | None = None
+) -> bool:
+    """Ensure a PID exists and belongs to target workspace / expected command."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+
+    try:
+        proc_cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+        if proc_cwd != target_ws and target_ws not in proc_cwd.parents and proc_cwd != REPO_ROOT:
+            return False
+    except OSError:
+        return False
+
+    if expected_pattern:
+        try:
+            cmdline_bytes = Path(f"/proc/{pid}/cmdline").read_bytes()
+            cmdline = cmdline_bytes.decode("utf-8", errors="ignore").replace("\x00", " ")
+            if expected_pattern not in cmdline:
+                return False
+        except OSError:
+            return False
+
+    return True
+
+
 def find_server_pid(port: int = 4096, ws: Path | None = None) -> int | None:
     """Find process ID listening on the given port, only if it belongs to demo workspace."""
     target_ws = (ws or DEMO_DIR).resolve()
@@ -199,8 +249,9 @@ def find_server_pid(port: int = 4096, ws: Path | None = None) -> int | None:
     if pid_file.is_file():
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)
-            return pid
+            if _validate_process_ownership(pid, target_ws, "opencode"):
+                return pid
+            pid_file.unlink(missing_ok=True)
         except (ValueError, OSError):
             pass
 
@@ -208,12 +259,8 @@ def find_server_pid(port: int = 4096, ws: Path | None = None) -> int | None:
         proc = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True)
         pids = [int(p) for p in proc.stdout.strip().split() if p.isdigit()]
         for p in pids:
-            try:
-                proc_cwd = Path(os.readlink(f"/proc/{p}/cwd")).resolve()
-                if proc_cwd == target_ws or target_ws in proc_cwd.parents:
-                    return p
-            except OSError:
-                continue
+            if _validate_process_ownership(p, target_ws, "opencode"):
+                return p
     except Exception:
         pass
     return None
@@ -226,8 +273,9 @@ def find_dashboard_pid(port: int = 4097, ws: Path | None = None) -> int | None:
     if pid_file.is_file():
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)
-            return pid
+            if _validate_process_ownership(pid, target_ws, "alienese.dashboard"):
+                return pid
+            pid_file.unlink(missing_ok=True)
         except (ValueError, OSError):
             pass
 
@@ -235,12 +283,8 @@ def find_dashboard_pid(port: int = 4097, ws: Path | None = None) -> int | None:
         proc = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True)
         pids = [int(p) for p in proc.stdout.strip().split() if p.isdigit()]
         for p in pids:
-            try:
-                proc_cwd = Path(os.readlink(f"/proc/{p}/cwd")).resolve()
-                if proc_cwd == target_ws or target_ws in proc_cwd.parents or proc_cwd == REPO_ROOT:
-                    return p
-            except OSError:
-                continue
+            if _validate_process_ownership(p, target_ws, "alienese.dashboard"):
+                return p
     except Exception:
         pass
     return None
@@ -469,16 +513,16 @@ def main() -> None:
         print(json.dumps({"server_stopped": stopped}))
 
     elif args.command == "find-pid":
-        pid = find_server_pid(port=args.port, ws=ws)
-        if pid is not None:
-            sys.stdout.write(str(pid))
-        sys.exit(0 if pid is not None else 1)
+        found_pid = find_server_pid(port=args.port, ws=ws)
+        if found_pid is not None:
+            sys.stdout.write(str(found_pid))
+        sys.exit(0 if found_pid is not None else 1)
 
     elif args.command == "start-dashboard":
-        pid = start_dashboard_server(ws, port=args.port)
+        dash_pid = start_dashboard_server(ws, port=args.port)
         print(
             json.dumps(
-                {"dashboard_started": True, "pid": pid, "url": f"http://127.0.0.1:{args.port}/"}
+                {"dashboard_started": True, "pid": dash_pid, "url": f"http://127.0.0.1:{args.port}/"}
             )
         )
 
@@ -487,10 +531,10 @@ def main() -> None:
         print(json.dumps({"dashboard_stopped": stopped}))
 
     elif args.command == "find-dashboard-pid":
-        pid = find_dashboard_pid(port=args.port, ws=ws)
-        if pid is not None:
-            sys.stdout.write(str(pid))
-        sys.exit(0 if pid is not None else 1)
+        found_dash_pid = find_dashboard_pid(port=args.port, ws=ws)
+        if found_dash_pid is not None:
+            sys.stdout.write(str(found_dash_pid))
+        sys.exit(0 if found_dash_pid is not None else 1)
 
     elif args.command == "extract-key":
         key = load_nebius_key()

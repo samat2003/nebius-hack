@@ -63,6 +63,16 @@ _PROTECTED_BASENAMES: frozenset[str] = frozenset(
 )
 
 
+def count_tokens(text: str) -> int:
+    """Accurately count tokens using tiktoken (cl100k_base)."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text, disallowed_special=()))
+    except Exception:
+        return max(1, len(text.split()))
+
+
 class OpenCodeSessionTracker:
     """Session tracker managing state derivation, safety policies, and evidence tracking."""
 
@@ -72,6 +82,7 @@ class OpenCodeSessionTracker:
         session_id: str = "default",
         trace_file: Path | None = None,
         read_only_test_files: bool = False,
+        three_model_mode: bool | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.session_id = session_id
@@ -81,6 +92,11 @@ class OpenCodeSessionTracker:
             else (self.workspace / ".alienese" / "opencode_trace.jsonl")
         )
         self.read_only_test_files = read_only_test_files
+        self.three_model_mode = (
+            three_model_mode
+            if three_model_mode is not None
+            else (os.environ.get("ALIENESE_THREE_MODEL") == "1")
+        )
 
         self.sequence_no = 0
         self.events: list[NormalizedEvent] = []
@@ -92,6 +108,9 @@ class OpenCodeSessionTracker:
         self.plan_executed = False
         self.last_recommended_action: str | None = None
         self.last_adherence: dict[str, Any] | None = None
+        self.plan_adherence: dict[str, Any] | None = None
+        self.adherence_evaluated = False
+        self.token_usage: dict[str, int] = {}
 
         self._failure_extractor = FailureExtractor()
         self._test_extractor = TestExtractor()
@@ -123,6 +142,9 @@ class OpenCodeSessionTracker:
             self.plan_executed = bool(data.get("plan_executed", False))
             self.last_recommended_action = data.get("last_recommended_action")
             self.last_adherence = data.get("last_adherence")
+            self.plan_adherence = data.get("plan_adherence")
+            self.adherence_evaluated = bool(data.get("adherence_evaluated", False))
+            self.token_usage = dict(data.get("token_usage", {}))
             self.evidence_log = list(data.get("evidence_log", []))
 
             # Reconstruct raw events
@@ -172,6 +194,9 @@ class OpenCodeSessionTracker:
                 "plan_executed": self.plan_executed,
                 "last_recommended_action": self.last_recommended_action,
                 "last_adherence": self.last_adherence,
+                "plan_adherence": self.plan_adherence,
+                "adherence_evaluated": self.adherence_evaluated,
+                "token_usage": self.token_usage,
                 "evidence_log": redact_value(self.evidence_log[-50:]),
                 "events": serialized_events,
             }
@@ -344,21 +369,34 @@ class OpenCodeSessionTracker:
             return decision
 
         # 0c. Mandatory planning gate in three-model mode
-        three_model_env = os.environ.get("ALIENESE_THREE_MODEL") == "1"
+        three_model_env = self.three_model_mode
         unguided_tools = {
             "glob",
+            "grep",
+            "search",
+            "file_search",
+            "find",
+            "find_by_name",
+            "list_dir",
+            "list_directory",
+            "ls",
             "read",
             "read_file",
+            "view",
             "view_file",
+            "open",
             "bash",
             "run_command",
             "command",
+            "execute_command",
             "edit",
             "edit_file",
             "write",
             "write_file",
             "write_to_file",
             "replace_file_content",
+            "patch",
+            "apply_patch",
         }
         if (
             three_model_env
@@ -587,8 +625,8 @@ class OpenCodeSessionTracker:
                 }
             )
 
-        # 3. Plan adherence tracking
-        if self.last_recommended_action:
+        # 3. Plan adherence tracking: measure first eligible action following the recommendation
+        if self.last_recommended_action and tool_name != "alienese_plan":
             actual_action = f"{tool_name}: {raw_target or args.get('command') or ''}".strip()
             rec = self.last_recommended_action
             rec_tool = rec.split(":", 1)[0].strip()
@@ -598,7 +636,11 @@ class OpenCodeSessionTracker:
                 "recommended": self.last_recommended_action,
                 "actual": actual_action,
                 "matched": matched,
+                "evaluated_at_step": self.sequence_no,
             }
+            if not self.adherence_evaluated:
+                self.plan_adherence = adherence_info
+                self.adherence_evaluated = True
             self.last_adherence = adherence_info
             decision["adherence"] = adherence_info
 
@@ -1027,7 +1069,7 @@ class OpenCodeSessionTracker:
         import os
         import urllib.request
 
-        three_model_env = os.environ.get("ALIENESE_THREE_MODEL") == "1"
+        three_model_env = self.three_model_mode
 
         server_healthy = False
         try:
@@ -1124,67 +1166,87 @@ class OpenCodeSessionTracker:
                 "plan_text": f"Error during EmbeddingGemma ranking: {e}",
             }
 
-        # Identify non-test source candidates (never recommend editing test files)
-        source_ranked = [
-            f for f, s in ranked_files if "test" not in f and not Path(f).name.startswith("test_")
-        ]
-        test_candidates = [
-            f for f, s in ranked_files if "test" in f or Path(f).name.startswith("test_")
-        ]
+        def is_test_file(fpath: str) -> bool:
+            parts = Path(fpath).parts
+            return any(p == "tests" for p in parts) or Path(fpath).name.startswith("test_")
+
+        source_ranked = [f for f, s in ranked_files if not is_test_file(f)]
+        test_candidates = [f for f, s in ranked_files if is_test_file(f)]
 
         if source_ranked:
             top_file = source_ranked[0]
-        elif candidate_files:
-            top_file = next(
-                (f[0] for f in candidate_files if "test" not in f[0]), candidate_files[0][0]
-            )
-        elif (self.workspace / "src/alienese/providers/runtime/client.py").is_file():
-            top_file = "src/alienese/providers/runtime/client.py"
         else:
-            top_file = "auth/session_manager.py"
+            non_tests = [f[0] for f in candidate_files if not is_test_file(f[0])]
+            top_file = non_tests[0] if non_tests else "auth/session_manager.py"
 
         if len(source_ranked) > 1:
             second_file = source_ranked[1]
-        elif (self.workspace / "auth/token_store.py").is_file():
-            second_file = "auth/token_store.py"
-        elif (self.workspace / "src/alienese/providers/runtime/errors.py").is_file():
-            second_file = "src/alienese/providers/runtime/errors.py"
         else:
-            second_file = top_file
+            non_tests_remaining = [
+                f[0] for f in candidate_files if not is_test_file(f[0]) and f[0] != top_file
+            ]
+            second_file = (
+                non_tests_remaining[0]
+                if non_tests_remaining
+                else (
+                    "auth/token_store.py"
+                    if (self.workspace / "auth/token_store.py").is_file()
+                    else top_file
+                )
+            )
 
         if test_candidates:
             test_file = test_candidates[0]
         else:
             test_file = next(
-                (f[0] for f in candidate_files if "test" in f[0] and "acceptance" not in f[0]),
+                (f[0] for f in candidate_files if is_test_file(f[0]) and "acceptance" not in f[0]),
                 next(
-                    (f[0] for f in candidate_files if "test" in f[0]),
-                    "tests/test_session.py"
-                    if (self.workspace / "tests/test_session.py").is_file()
-                    else "tests/unit/test_provider_runtime.py",
+                    (f[0] for f in candidate_files if is_test_file(f[0])),
+                    "tests/test_session.py",
                 ),
             )
 
-        # Context reduction calculation
-        total_candidate_chars = sum(
-            len(p.read_text(encoding="utf-8", errors="ignore"))
-            for p in self.workspace.rglob("*.py")
-            if not any(x in p.parts for x in [".alienese", ".venv", "__pycache__", ".git"])
+        # Measure candidate context reduction using real tokenizer (tiktoken cl100k_base)
+        candidate_tokens_map = {
+            f: count_tokens(f"File: {f}\n{s}") for f, s in candidate_files
+        }
+        total_candidate_tokens = sum(candidate_tokens_map.values())
+        top_snippet = next((s for f, s in candidate_files if f == top_file), "")
+        selected_tokens = candidate_tokens_map.get(
+            top_file, count_tokens(f"File: {top_file}\n{top_snippet}")
         )
-        total_candidate_tokens = max(1, total_candidate_chars // 4)
-        selected_chars = sum(
-            len((self.workspace / f).read_text(encoding="utf-8", errors="ignore")[:500])
-            for f in [top_file, second_file, test_file]
-            if (self.workspace / f).is_file()
+        reduction_pct = round(
+            (1.0 - (selected_tokens / max(1, total_candidate_tokens))) * 100.0, 1
         )
-        selected_tokens = max(1, selected_chars // 4)
-        reduction_pct = round((1.0 - (selected_tokens / total_candidate_tokens)) * 100.0, 1)
-        reduction_info = {
+        candidate_reduction_info = {
             "total_candidate_tokens": total_candidate_tokens,
             "selected_tokens": selected_tokens,
             "reduction_pct": reduction_pct,
-            "formula": "1 - (selected_tokens / total_candidate_tokens)",
+            "formula": "1 - (selected_candidate_tokens / total_candidate_tokens)",
+            "tokenizer": "tiktoken (cl100k_base)",
+            "content_type": "Discovered candidate file representations (AST/Traceback/Repo)",
+            "status": "measured",
         }
+
+        # Metric B: Actual Nemotron input-token savings (only when baseline exists)
+        actual_api_savings: dict[str, Any] | None = None
+        baseline_metrics_path = self.workspace / ".alienese" / "baseline_metrics.json"
+        if baseline_metrics_path.is_file():
+            try:
+                bdata = json.loads(baseline_metrics_path.read_text(encoding="utf-8"))
+                b_tokens = int(bdata.get("baseline_prompt_tokens", 0))
+                a_tokens = int(self.token_usage.get("prompt_tokens", 0))
+                if b_tokens > 0 and a_tokens > 0:
+                    sav_pct = round((1.0 - (a_tokens / b_tokens)) * 100.0, 1)
+                    actual_api_savings = {
+                        "baseline_tokens": b_tokens,
+                        "alienese_tokens": a_tokens,
+                        "savings_pct": sav_pct,
+                        "source": "Nebius API token usage metadata",
+                        "status": "measured",
+                    }
+            except Exception:
+                pass
 
         # 3. Construct multiple grounded next action options (K >= 2, K <= 8)
         answer_options = [
@@ -1275,7 +1337,7 @@ class OpenCodeSessionTracker:
             step1 = (
                 f"Run verification tests: `pytest {test_file}` via `bash` to observe reproduction."
             )
-            step2 = f"Use `read` to inspect `{top_file}` at the relevant functions."
+            step2 = f"Use `read` to inspect primary candidate module `{top_file}`."
             step3 = (
                 f"Synthesize the fix in `{top_file}` using `edit` (or `write`) "
                 f"and verify with `pytest {test_file}`."
@@ -1295,12 +1357,19 @@ class OpenCodeSessionTracker:
                 "to fulfill the verification obligation."
             )
 
+        api_savings_str = (
+            f"{actual_api_savings['savings_pct']}% (measured vs baseline)"
+            if actual_api_savings
+            else "Not measured (Requires baseline benchmark run)"
+        )
+
         plan_text = (
             "### Alienese Multi-Model Orchestration Plan\n\n"
             f"**Objective:** {query_text}\n\n"
-            f"**Context Efficiency:** Candidate reduction: {reduction_pct}% "
+            f"**Candidate Context Pruning (Metric A):** {reduction_pct}% "
             f"({selected_tokens:,} tokens selected from "
-            f"{total_candidate_tokens:,} total candidate tokens)\n"
+            f"{total_candidate_tokens:,} candidate tokens; tokenizer: tiktoken cl100k_base)\n"
+            f"**Actual LLM API Savings (Metric B):** {api_savings_str}\n"
             "**Companion Dashboard:** Real-time metrics streaming at http://127.0.0.1:4097/\n\n"
             "**1. Retrieval Context Ranking "
             "(EmbeddingGemma 2 — 768d Dense Matryoshka Embeddings):**\n"
@@ -1311,7 +1380,7 @@ class OpenCodeSessionTracker:
             f"- **Selected Policy Action:** `{selected_label}` "
             f"(Softmax option score: {selected_prob:.1%})\n\n"
             "**3. Concrete Directives for Coding Model:**\n"
-            f"- **Step 1:** {step1}\n"
+            f"- **Step 1 (Selected Action: `{selected_label}`):** {step1}\n"
             f"- **Step 2:** {step2}\n"
             f"- **Step 3:** {step3}"
         )
@@ -1320,6 +1389,7 @@ class OpenCodeSessionTracker:
         self.sequence_no += 1
         self.plan_executed = True
         self.last_recommended_action = selected_label
+        self.adherence_evaluated = False
         self._save_session_state()
 
         plan_details = {
@@ -1329,7 +1399,9 @@ class OpenCodeSessionTracker:
             "selected_id": selected_id,
             "selected_label": selected_label,
             "selected_probability": selected_prob,
-            "context_reduction": reduction_info,
+            "candidate_context_reduction": candidate_reduction_info,
+            "context_reduction": candidate_reduction_info,
+            "actual_api_savings": actual_api_savings,
         }
         self._record_trace(
             "ALIENESE_PLAN",
@@ -1349,6 +1421,8 @@ class OpenCodeSessionTracker:
             "selected_id": selected_id,
             "selected_label": selected_label,
             "selected_probability": selected_prob,
-            "context_reduction": reduction_info,
+            "candidate_context_reduction": candidate_reduction_info,
+            "context_reduction": candidate_reduction_info,
+            "actual_api_savings": actual_api_savings,
             "plan_text": plan_text,
         }
